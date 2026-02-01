@@ -1,0 +1,17 @@
+__pycache__
+*.egg-info
+
+wan_models
+checkpoints
+
+*.pyc
+**/__pycache__
+
+VideoAlign/wandb
+VideoAlign/debug.sh
+VideoAlign/_temp_videos
+VideoAlign/anno
+VideoAlign/checkpoints
+
+checkpoints
+wan_models
