@@ -10,7 +10,7 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from model import CausVid, DMD, SiD, DMDRL
 import torch
 import wandb
 import time
@@ -62,6 +62,8 @@ class Trainer:
             self.model = CausVid(config, device=self.device)
         elif config.distribution_loss == "dmd":
             self.model = DMD(config, device=self.device)
+        elif config.distribution_loss == "dmd_rl":
+            self.model = DMDRL(config, device=self.device)
         elif config.distribution_loss == "sid":
             self.model = SiD(config, device=self.device)
         else:
@@ -99,7 +101,8 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # VAE is needed for: visualization, raw video loading, or dmd_rl (RL reward computation)
+        if not config.no_visualize or config.load_raw_video or config.distribution_loss == "dmd_rl":
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -242,13 +245,25 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
-            generator_loss, generator_log_dict = self.model.generator_loss(
-                image_or_video_shape=image_or_video_shape,
-                conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict,
-                clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
-            )
+            # Check if model is DMDRL (needs text_prompts and current_step for RL)
+            if self.config.distribution_loss == "dmd_rl":
+                generator_loss, generator_log_dict = self.model.generator_loss(
+                    image_or_video_shape=image_or_video_shape,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    clean_latent=clean_latent,
+                    initial_latent=image_latent if self.config.i2v else None,
+                    text_prompts=text_prompts,
+                    current_step=self.step
+                )
+            else:
+                generator_loss, generator_log_dict = self.model.generator_loss(
+                    image_or_video_shape=image_or_video_shape,
+                    conditional_dict=conditional_dict,
+                    unconditional_dict=unconditional_dict,
+                    clean_latent=clean_latent,
+                    initial_latent=image_latent if self.config.i2v else None
+                )
 
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
@@ -361,6 +376,19 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+
+                    # Log RL-specific metrics if using dmd_rl
+                    if self.config.distribution_loss == "dmd_rl":
+                        if "rl_loss" in generator_log_dict:
+                            wandb_loss_dict["rl_loss"] = generator_log_dict["rl_loss"]
+                        if "rl_reward_mean" in generator_log_dict:
+                            wandb_loss_dict["rl_reward_mean"] = generator_log_dict["rl_reward_mean"]
+                        if "rl_enabled" in generator_log_dict:
+                            wandb_loss_dict["rl_enabled"] = float(generator_log_dict["rl_enabled"])
+                        if "dmd_loss" in generator_log_dict:
+                            wandb_loss_dict["dmd_loss"] = generator_log_dict["dmd_loss"]
+                        if "total_generator_loss" in generator_log_dict:
+                            wandb_loss_dict["total_generator_loss"] = generator_log_dict["total_generator_loss"]
 
                 wandb_loss_dict.update(
                     {
