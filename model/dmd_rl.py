@@ -95,8 +95,15 @@ class DMDRL(DMD):
             device=self.device,
             dtype=self.dtype
         )
+
+        # Freeze reward model parameters to:
+        # 1. Prevent reward model from being updated
+        # 2. Save GPU memory (no gradient storage for reward model params)
+        # Note: Gradients can still flow THROUGH the reward model back to generator
+        self._reward_model.inferencer.model.requires_grad_(False)
+
         self._reward_model_initialized = True
-        print(f"[DMDRL] Reward model initialized successfully")
+        print(f"[DMDRL] Reward model initialized and frozen successfully")
 
     def enable_rl(self, current_step: int) -> bool:
         """
