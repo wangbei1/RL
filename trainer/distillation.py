@@ -1,5 +1,6 @@
 import gc
 import logging
+from datetime import datetime
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
@@ -43,6 +44,9 @@ class Trainer:
             config.seed = random_seed.item()
 
         set_seed(config.seed + global_rank)
+
+        # Initialize local logging directory and log file
+        self._init_local_logging(config)
 
         if self.is_main_process and not self.disable_wandb:
             wandb.login(host=config.wandb_host, key=config.wandb_key)
@@ -181,6 +185,72 @@ class Trainer:
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
+
+    def _init_local_logging(self, config):
+        """
+        Initialize local logging directory and log file.
+        Creates: output/{timestamp}_{experiment_name}/log.txt
+        """
+        if not self.is_main_process:
+            self.exp_dir = None
+            self.log_file = None
+            return
+
+        # Create experiment directory name: timestamp + config name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        exp_name = getattr(config, "config_name", "experiment")
+        exp_dir_name = f"{timestamp}_{exp_name}"
+
+        # Create output directory
+        output_base = getattr(config, "output_dir", "output")
+        self.exp_dir = os.path.join(output_base, exp_dir_name)
+        os.makedirs(self.exp_dir, exist_ok=True)
+
+        # Create log file
+        self.log_file = os.path.join(self.exp_dir, "log.txt")
+
+        # Write header to log file
+        with open(self.log_file, "w") as f:
+            f.write(f"Experiment: {exp_name}\n")
+            f.write(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Distribution loss: {config.distribution_loss}\n")
+            f.write("=" * 80 + "\n")
+            # Write column headers
+            if config.distribution_loss == "dmd_rl":
+                f.write(f"{'step':>8} | {'dmd_loss':>10} | {'rl_loss':>10} | {'reward_raw':>12} | {'reward_norm':>12} | {'total_loss':>12} | {'rl_enabled':>10}\n")
+            else:
+                f.write(f"{'step':>8} | {'generator_loss':>14} | {'critic_loss':>12}\n")
+            f.write("-" * 80 + "\n")
+
+        print(f"[Logging] Experiment directory: {self.exp_dir}")
+        print(f"[Logging] Log file: {self.log_file}")
+
+    def _log_to_file(self, step, generator_log_dict, critic_log_dict):
+        """
+        Write training metrics to local log file.
+        """
+        if not self.is_main_process or self.log_file is None:
+            return
+
+        with open(self.log_file, "a") as f:
+            if self.config.distribution_loss == "dmd_rl":
+                dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
+                rl_loss = generator_log_dict.get("rl_loss", 0.0)
+                reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
+                reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
+                total_loss = generator_log_dict.get("total_generator_loss", 0.0)
+                rl_enabled = generator_log_dict.get("rl_enabled", False)
+
+                f.write(f"{step:>8} | {dmd_loss:>10.4f} | {rl_loss:>10.4f} | {reward_raw:>12.4f} | {reward_norm:>12.4f} | {total_loss:>12.4f} | {str(rl_enabled):>10}\n")
+            else:
+                gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
+                if isinstance(gen_loss, torch.Tensor):
+                    gen_loss = gen_loss.mean().item()
+                critic_loss = critic_log_dict.get("critic_loss", torch.tensor(0.0))
+                if isinstance(critic_loss, torch.Tensor):
+                    critic_loss = critic_loss.mean().item()
+
+                f.write(f"{step:>8} | {gen_loss:>14.4f} | {critic_loss:>12.4f}\n")
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -398,6 +468,10 @@ class Trainer:
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
+
+                # Log to local file
+                if TRAIN_GENERATOR:
+                    self._log_to_file(self.step, generator_log_dict, critic_log_dict)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:

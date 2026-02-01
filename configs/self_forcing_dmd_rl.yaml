@@ -122,6 +122,7 @@ load_raw_video: false
 no_visualize: true
 no_save: false
 gc_interval: 50
+output_dir: output                   # Base directory for experiment logs
 
 # Self-forcing specific
 num_training_frames: 21
