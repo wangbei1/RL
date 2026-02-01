@@ -10,6 +10,7 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - LoRA support for the generator to prevent training collapse
+- Reward normalization support for stable training
 """
 
 from pipeline import SelfForcingTrainingPipeline
@@ -37,6 +38,9 @@ class DMDRL(DMD):
             - rl_target_height: Target height for reward model (must be multiple of 28)
             - rl_target_width: Target width for reward model (must be multiple of 28)
             - rl_reward_type: Type of reward to use ('VQ', 'MQ', 'TA', 'overall') (default: 'overall')
+            - rl_reward_normalize: Whether to normalize rewards (default: True)
+            - rl_reward_scale: Scale factor for rewards after normalization (default: 1.0)
+            - rl_reward_baseline: Baseline to subtract from rewards (default: 0.0)
         """
         super().__init__(args, device)
 
@@ -50,6 +54,19 @@ class DMDRL(DMD):
         self.rl_target_height = getattr(args, "rl_target_height", 336)  # Must be multiple of 28
         self.rl_target_width = getattr(args, "rl_target_width", 504)    # Must be multiple of 28
         self.rl_reward_type = getattr(args, "rl_reward_type", "overall")  # VQ, MQ, TA, or overall
+
+        # Reward normalization configuration
+        # The raw logits from the reward model can have arbitrary scale
+        # Normalization helps stabilize training by keeping RL loss in a reasonable range
+        self.rl_reward_normalize = getattr(args, "rl_reward_normalize", True)
+        self.rl_reward_scale = getattr(args, "rl_reward_scale", 1.0)
+        self.rl_reward_baseline = getattr(args, "rl_reward_baseline", 0.0)
+
+        # Running statistics for reward normalization (EMA)
+        self.rl_reward_ema_mean = 0.0
+        self.rl_reward_ema_std = 1.0
+        self.rl_reward_ema_decay = getattr(args, "rl_reward_ema_decay", 0.99)
+        self._reward_stats_initialized = False
 
         # Validate target dimensions
         assert self.rl_target_height % 28 == 0, f"rl_target_height must be multiple of 28, got {self.rl_target_height}"
@@ -97,6 +114,59 @@ class DMDRL(DMD):
             self._initialize_reward_model()
         return self.rl_enabled
 
+    def _update_reward_stats(self, reward_value: float):
+        """
+        Update running statistics for reward normalization using EMA.
+
+        Args:
+            reward_value: Raw reward value to update statistics with
+        """
+        if not self._reward_stats_initialized:
+            self.rl_reward_ema_mean = reward_value
+            self.rl_reward_ema_std = 1.0  # Initial std
+            self._reward_stats_initialized = True
+        else:
+            # Update mean with EMA
+            delta = reward_value - self.rl_reward_ema_mean
+            self.rl_reward_ema_mean = self.rl_reward_ema_mean + (1 - self.rl_reward_ema_decay) * delta
+            # Update std with EMA (using squared difference)
+            self.rl_reward_ema_std = self.rl_reward_ema_decay * self.rl_reward_ema_std + \
+                                     (1 - self.rl_reward_ema_decay) * abs(delta)
+            # Ensure std is not too small
+            self.rl_reward_ema_std = max(self.rl_reward_ema_std, 0.1)
+
+    def _normalize_reward(self, reward: torch.Tensor, raw_reward_value: float) -> torch.Tensor:
+        """
+        Normalize reward for stable training.
+
+        Processing pipeline:
+        1. Subtract running mean (centering)
+        2. Divide by running std (scaling to unit variance)
+        3. Apply user-defined scale factor
+        4. Subtract user-defined baseline
+
+        Args:
+            reward: Raw reward tensor (with gradients)
+            raw_reward_value: Detached reward value for stats update
+
+        Returns:
+            Normalized reward tensor (preserves gradients)
+        """
+        if not self.rl_reward_normalize:
+            return reward * self.rl_reward_scale - self.rl_reward_baseline
+
+        # Update running statistics (using detached value)
+        self._update_reward_stats(raw_reward_value)
+
+        # Normalize: (reward - mean) / std
+        # Note: We use detached stats to avoid second-order gradients
+        normalized = (reward - self.rl_reward_ema_mean) / self.rl_reward_ema_std
+
+        # Apply scale and baseline
+        normalized = normalized * self.rl_reward_scale - self.rl_reward_baseline
+
+        return normalized
+
     def compute_rl_loss(
         self,
         latent: torch.Tensor,
@@ -117,7 +187,8 @@ class DMDRL(DMD):
             # Return zero loss if RL is not enabled
             return torch.tensor(0.0, device=self.device, requires_grad=True), {
                 "rl_loss": 0.0,
-                "rl_reward_mean": 0.0,
+                "rl_reward_raw": 0.0,
+                "rl_reward_normalized": 0.0,
                 "rl_enabled": False
             }
 
@@ -129,7 +200,8 @@ class DMDRL(DMD):
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
-        rewards_list = []
+        raw_rewards_list = []
+        normalized_rewards_list = []
 
         for i in range(batch_size):
             # Get single video: [T, C, H, W]
@@ -155,8 +227,15 @@ class DMDRL(DMD):
             else:  # overall
                 reward = rewards.sum()
 
-            total_reward = total_reward + reward
-            rewards_list.append(reward.detach().item())
+            # Store raw reward value (detached for logging)
+            raw_reward_value = reward.detach().item()
+            raw_rewards_list.append(raw_reward_value)
+
+            # Normalize reward
+            normalized_reward = self._normalize_reward(reward, raw_reward_value)
+            normalized_rewards_list.append(normalized_reward.detach().item())
+
+            total_reward = total_reward + normalized_reward
 
         # Average reward across batch
         avg_reward = total_reward / batch_size
@@ -166,7 +245,10 @@ class DMDRL(DMD):
 
         rl_log_dict = {
             "rl_loss": rl_loss.detach().item(),
-            "rl_reward_mean": sum(rewards_list) / len(rewards_list),
+            "rl_reward_raw": sum(raw_rewards_list) / len(raw_rewards_list),
+            "rl_reward_normalized": sum(normalized_rewards_list) / len(normalized_rewards_list),
+            "rl_reward_ema_mean": self.rl_reward_ema_mean,
+            "rl_reward_ema_std": self.rl_reward_ema_std,
             "rl_enabled": True
         }
 

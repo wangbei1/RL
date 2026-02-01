@@ -379,16 +379,15 @@ class Trainer:
 
                     # Log RL-specific metrics if using dmd_rl
                     if self.config.distribution_loss == "dmd_rl":
-                        if "rl_loss" in generator_log_dict:
-                            wandb_loss_dict["rl_loss"] = generator_log_dict["rl_loss"]
-                        if "rl_reward_mean" in generator_log_dict:
-                            wandb_loss_dict["rl_reward_mean"] = generator_log_dict["rl_reward_mean"]
-                        if "rl_enabled" in generator_log_dict:
-                            wandb_loss_dict["rl_enabled"] = float(generator_log_dict["rl_enabled"])
-                        if "dmd_loss" in generator_log_dict:
-                            wandb_loss_dict["dmd_loss"] = generator_log_dict["dmd_loss"]
-                        if "total_generator_loss" in generator_log_dict:
-                            wandb_loss_dict["total_generator_loss"] = generator_log_dict["total_generator_loss"]
+                        rl_metrics = [
+                            "rl_loss", "rl_reward_raw", "rl_reward_normalized",
+                            "rl_reward_ema_mean", "rl_reward_ema_std", "rl_enabled",
+                            "dmd_loss", "total_generator_loss"
+                        ]
+                        for key in rl_metrics:
+                            if key in generator_log_dict:
+                                value = generator_log_dict[key]
+                                wandb_loss_dict[key] = float(value) if isinstance(value, bool) else value
 
                 wandb_loss_dict.update(
                     {

@@ -95,6 +95,13 @@ rl_target_height: 336            # Target height for reward model (must be multi
 rl_target_width: 504             # Target width for reward model (must be multiple of 28)
 rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 
+# Reward normalization (for stable training)
+# The raw logits from reward model can have arbitrary scale, normalization helps
+rl_reward_normalize: true        # Whether to normalize rewards using running statistics
+rl_reward_scale: 1.0             # Scale factor applied after normalization
+rl_reward_baseline: 0.0          # Baseline subtracted from normalized reward
+rl_reward_ema_decay: 0.99        # EMA decay for running mean/std
+
 # ============================================
 # LoRA configuration (optional, for stable training)
 # ============================================
