@@ -1,0 +1,128 @@
+# DMD + RL Training Configuration with DeepSpeed
+# Uses ZeRO-2 with CPU offload for memory efficiency
+#
+# Usage:
+#   deepspeed --num_gpus=8 train.py --config configs/self_forcing_dmd_rl_deepspeed.yaml
+
+# Generator checkpoint (pre-trained)
+generator_ckpt: checkpoints/ode_init.pt
+
+# Model names
+real_name: Wan2.1-T2V-14B
+
+# Denoising configuration
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+
+# Precision and seed
+mixed_precision: true
+seed: 0
+
+# Wandb logging (replace with your credentials)
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+
+# Optimizer settings
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+
+# Data
+data_path: prompts/vidprom_filtered_extended.txt
+batch_size: 1
+
+# EMA
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 100
+
+# Negative prompt for CFG
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+# Training ratio
+dfake_gen_update_ratio: 5
+
+# Video shape [B, T, C, H, W]
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ============================================
+# Trainer: DeepSpeed version
+# ============================================
+distribution_loss: dmd_rl
+trainer: score_distillation_deepspeed
+
+# DeepSpeed configuration
+# Options: configs/deepspeed_config.json (ZeRO-2) or configs/deepspeed_zero3_offload.json (ZeRO-3)
+deepspeed_config: configs/deepspeed_config.json
+
+# ============================================
+# RL loss configuration
+# ============================================
+rl_loss_weight: 0.1              # Weight for RL loss: loss = dmd_loss + rl_loss_weight * rl_loss
+rl_cold_start_steps: 500         # Number of steps before RL loss is enabled (cold start)
+rl_reward_checkpoint: checkpoints/reward_model  # Path to reward model checkpoint
+rl_target_height: 336            # Target height for reward model (must be multiple of 28)
+rl_target_width: 504             # Target width for reward model (must be multiple of 28)
+rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
+
+# Reward normalization (for stable training)
+rl_reward_normalize: true
+rl_reward_scale: 1.0
+rl_reward_baseline: 0.0
+rl_reward_ema_decay: 0.99
+
+# ============================================
+# LoRA configuration (optional)
+# ============================================
+use_lora: false
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.0
+
+# Other settings
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+no_visualize: true
+no_save: false
+gc_interval: 50
+output_dir: output
+
+# Self-forcing specific
+num_training_frames: 21
+independent_first_frame: false
+same_step_across_blocks: true
+backward_simulation: true
+last_step_only: false
+context_noise: 0.0
+i2v: false
+causal: true
+
+# Model kwargs
+model_kwargs:
+  timestep_shift: 5.0
+
+# Gradient clipping
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
