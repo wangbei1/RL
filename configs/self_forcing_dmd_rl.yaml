@@ -124,6 +124,11 @@ no_save: false
 gc_interval: 50
 output_dir: output                   # Base directory for experiment logs
 
+# Experiment naming and training control
+exp_name: dmd_rl_experiment          # Experiment name for folder naming (replaces config name)
+max_training_steps: 10000            # Maximum training steps (null for unlimited)
+num_demo_videos: 20                  # Number of demo videos to generate after training (0 to disable)
+
 # Self-forcing specific
 num_training_frames: 21
 independent_first_frame: false

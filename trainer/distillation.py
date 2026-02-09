@@ -16,6 +16,7 @@ import torch
 import wandb
 import time
 import os
+import numpy as np
 
 
 class Trainer:
@@ -191,14 +192,26 @@ class Trainer:
         Initialize local logging directory and log file.
         Creates: output/{timestamp}_{experiment_name}/log.txt
         """
+        # Initialize training history for plotting
+        self.training_history = {
+            "steps": [],
+            "generator_loss": [],
+            "critic_loss": [],
+            "dmd_loss": [],
+            "rl_loss": [],
+            "rl_reward_raw": [],
+            "rl_reward_normalized": [],
+        }
+
         if not self.is_main_process:
             self.exp_dir = None
             self.log_file = None
             return
 
-        # Create experiment directory name: timestamp + config name
+        # Create experiment directory name: timestamp + experiment name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_name = getattr(config, "config_name", "experiment")
+        # Use exp_name config if provided, otherwise fall back to config_name
+        exp_name = getattr(config, "exp_name", None) or getattr(config, "config_name", "experiment")
         exp_dir_name = f"{timestamp}_{exp_name}"
 
         # Create output directory
@@ -214,6 +227,7 @@ class Trainer:
             f.write(f"Experiment: {exp_name}\n")
             f.write(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Distribution loss: {config.distribution_loss}\n")
+            f.write(f"Max training steps: {getattr(config, 'max_training_steps', 'unlimited')}\n")
             f.write("=" * 80 + "\n")
             # Write column headers
             if config.distribution_loss == "dmd_rl":
@@ -227,8 +241,35 @@ class Trainer:
 
     def _log_to_file(self, step, generator_log_dict, critic_log_dict):
         """
-        Write training metrics to local log file.
+        Write training metrics to local log file and store in history for plotting.
         """
+        # Store in history for plotting
+        self.training_history["steps"].append(step)
+
+        if self.config.distribution_loss == "dmd_rl":
+            dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
+            rl_loss = generator_log_dict.get("rl_loss", 0.0)
+            reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
+            reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
+            total_loss = generator_log_dict.get("total_generator_loss", 0.0)
+            rl_enabled = generator_log_dict.get("rl_enabled", False)
+
+            self.training_history["dmd_loss"].append(dmd_loss)
+            self.training_history["rl_loss"].append(rl_loss)
+            self.training_history["rl_reward_raw"].append(reward_raw)
+            self.training_history["rl_reward_normalized"].append(reward_norm)
+            self.training_history["generator_loss"].append(total_loss)
+        else:
+            gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
+            if isinstance(gen_loss, torch.Tensor):
+                gen_loss = gen_loss.mean().item()
+            self.training_history["generator_loss"].append(gen_loss)
+
+        critic_loss = critic_log_dict.get("critic_loss", torch.tensor(0.0))
+        if isinstance(critic_loss, torch.Tensor):
+            critic_loss = critic_loss.mean().item()
+        self.training_history["critic_loss"].append(critic_loss)
+
         if not self.is_main_process or self.log_file is None:
             return
 
@@ -246,11 +287,11 @@ class Trainer:
                 gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
                 if isinstance(gen_loss, torch.Tensor):
                     gen_loss = gen_loss.mean().item()
-                critic_loss = critic_log_dict.get("critic_loss", torch.tensor(0.0))
-                if isinstance(critic_loss, torch.Tensor):
-                    critic_loss = critic_loss.mean().item()
+                critic_loss_val = critic_log_dict.get("critic_loss", torch.tensor(0.0))
+                if isinstance(critic_loss_val, torch.Tensor):
+                    critic_loss_val = critic_loss_val.mean().item()
 
-                f.write(f"{step:>8} | {gen_loss:>14.4f} | {critic_loss:>12.4f}\n")
+                f.write(f"{step:>8} | {gen_loss:>14.4f} | {critic_loss_val:>12.4f}\n")
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -272,12 +313,218 @@ class Trainer:
             }
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            # Save to experiment directory (exp_dir) instead of output_path
+            save_dir = self.exp_dir if self.exp_dir else self.output_path
+            checkpoint_dir = os.path.join(save_dir, f"checkpoint_model_{self.step:06d}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            save_path = os.path.join(checkpoint_dir, "model.pt")
+            torch.save(state_dict, save_path)
+            print(f"Model saved to {save_path}")
+
+    def _plot_training_curves(self):
+        """
+        Plot training curves and save to experiment directory.
+        """
+        if not self.is_main_process or self.exp_dir is None:
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("[Warning] matplotlib not available, skipping curve plotting")
+            return
+
+        steps = self.training_history["steps"]
+        if len(steps) == 0:
+            return
+
+        # Create figure with subplots
+        if self.config.distribution_loss == "dmd_rl":
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+            # Plot DMD Loss
+            if self.training_history["dmd_loss"]:
+                axes[0, 0].plot(steps, self.training_history["dmd_loss"], label='DMD Loss')
+                axes[0, 0].set_xlabel('Step')
+                axes[0, 0].set_ylabel('Loss')
+                axes[0, 0].set_title('DMD Loss')
+                axes[0, 0].legend()
+                axes[0, 0].grid(True)
+
+            # Plot RL Loss
+            if self.training_history["rl_loss"]:
+                axes[0, 1].plot(steps, self.training_history["rl_loss"], label='RL Loss', color='orange')
+                axes[0, 1].set_xlabel('Step')
+                axes[0, 1].set_ylabel('Loss')
+                axes[0, 1].set_title('RL Loss')
+                axes[0, 1].legend()
+                axes[0, 1].grid(True)
+
+            # Plot Total Generator Loss
+            if self.training_history["generator_loss"]:
+                axes[0, 2].plot(steps, self.training_history["generator_loss"], label='Total Loss', color='green')
+                axes[0, 2].set_xlabel('Step')
+                axes[0, 2].set_ylabel('Loss')
+                axes[0, 2].set_title('Total Generator Loss')
+                axes[0, 2].legend()
+                axes[0, 2].grid(True)
+
+            # Plot Raw Reward
+            if self.training_history["rl_reward_raw"]:
+                axes[1, 0].plot(steps, self.training_history["rl_reward_raw"], label='Raw Reward', color='purple')
+                axes[1, 0].set_xlabel('Step')
+                axes[1, 0].set_ylabel('Reward')
+                axes[1, 0].set_title('Raw Reward')
+                axes[1, 0].legend()
+                axes[1, 0].grid(True)
+
+            # Plot Normalized Reward
+            if self.training_history["rl_reward_normalized"]:
+                axes[1, 1].plot(steps, self.training_history["rl_reward_normalized"], label='Normalized Reward', color='red')
+                axes[1, 1].set_xlabel('Step')
+                axes[1, 1].set_ylabel('Reward')
+                axes[1, 1].set_title('Normalized Reward')
+                axes[1, 1].legend()
+                axes[1, 1].grid(True)
+
+            # Plot Critic Loss
+            if self.training_history["critic_loss"]:
+                axes[1, 2].plot(steps, self.training_history["critic_loss"], label='Critic Loss', color='brown')
+                axes[1, 2].set_xlabel('Step')
+                axes[1, 2].set_ylabel('Loss')
+                axes[1, 2].set_title('Critic Loss')
+                axes[1, 2].legend()
+                axes[1, 2].grid(True)
+        else:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # Plot Generator Loss
+            if self.training_history["generator_loss"]:
+                axes[0].plot(steps, self.training_history["generator_loss"], label='Generator Loss')
+                axes[0].set_xlabel('Step')
+                axes[0].set_ylabel('Loss')
+                axes[0].set_title('Generator Loss')
+                axes[0].legend()
+                axes[0].grid(True)
+
+            # Plot Critic Loss
+            if self.training_history["critic_loss"]:
+                axes[1].plot(steps, self.training_history["critic_loss"], label='Critic Loss', color='orange')
+                axes[1].set_xlabel('Step')
+                axes[1].set_ylabel('Loss')
+                axes[1].set_title('Critic Loss')
+                axes[1].legend()
+                axes[1].grid(True)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self.exp_dir, "training_curves.png")
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"[Plotting] Training curves saved to {plot_path}")
+
+    def _generate_demo_videos(self, num_videos=20):
+        """
+        Generate demo videos at the end of training.
+        """
+        if not self.is_main_process:
+            return
+
+        # Read prompts from MovieGenVideoBench.txt
+        prompts_file = "prompts/MovieGenVideoBench.txt"
+        if not os.path.exists(prompts_file):
+            print(f"[Warning] Prompts file not found: {prompts_file}, skipping demo video generation")
+            return
+
+        with open(prompts_file, "r") as f:
+            all_prompts = [line.strip() for line in f if line.strip()]
+
+        prompts = all_prompts[:num_videos]
+        if len(prompts) == 0:
+            print("[Warning] No prompts found, skipping demo video generation")
+            return
+
+        print(f"[Demo] Generating {len(prompts)} demo videos...")
+
+        # Create demo videos directory
+        demo_dir = os.path.join(self.exp_dir, "demo_videos")
+        os.makedirs(demo_dir, exist_ok=True)
+
+        # Initialize inference pipeline if not exists
+        if not hasattr(self, '_inference_pipeline'):
+            from pipeline import SelfForcingTrainingPipeline
+            self._inference_pipeline = SelfForcingTrainingPipeline(
+                generator=self.model.generator,
+                text_encoder=self.model.text_encoder,
+                vae=self.model.vae,
+                scheduler=self.model.scheduler,
+                denoising_step_list=self.model.denoising_step_list,
+                device=self.device
+            )
+
+        # Generate videos one by one
+        try:
+            import imageio
+        except ImportError:
+            print("[Warning] imageio not available, saving as numpy arrays instead")
+            imageio = None
+
+        for i, prompt in enumerate(prompts):
+            print(f"[Demo] Generating video {i+1}/{len(prompts)}: {prompt[:50]}...")
+            try:
+                with torch.no_grad():
+                    video = self.generate_video(self._inference_pipeline, [prompt])
+                    video = video[0]  # [T, H, W, C]
+
+                # Save video
+                if imageio is not None:
+                    video_path = os.path.join(demo_dir, f"video_{i:03d}.mp4")
+                    video_uint8 = video.astype(np.uint8)
+                    imageio.mimwrite(video_path, video_uint8, fps=8, codec='libx264')
+                else:
+                    video_path = os.path.join(demo_dir, f"video_{i:03d}.npy")
+                    np.save(video_path, video)
+
+                # Save prompt
+                prompt_path = os.path.join(demo_dir, f"video_{i:03d}_prompt.txt")
+                with open(prompt_path, "w") as f:
+                    f.write(prompt)
+
+            except Exception as e:
+                print(f"[Demo] Error generating video {i}: {e}")
+                continue
+
+        print(f"[Demo] Demo videos saved to {demo_dir}")
+
+    def _on_training_end(self):
+        """
+        Actions to perform at the end of training.
+        """
+        if self.is_main_process:
+            print("\n" + "=" * 50)
+            print("Training completed!")
+            print("=" * 50)
+
+            # Plot training curves
+            print("\n[Post-training] Plotting training curves...")
+            self._plot_training_curves()
+
+            # Generate demo videos
+            num_demo_videos = getattr(self.config, "num_demo_videos", 20)
+            if num_demo_videos > 0:
+                print(f"\n[Post-training] Generating {num_demo_videos} demo videos...")
+                self._generate_demo_videos(num_videos=num_demo_videos)
+
+            # Write final summary to log
+            if self.log_file:
+                with open(self.log_file, "a") as f:
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write(f"Training completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Total steps: {self.step}\n")
+                    f.write("=" * 80 + "\n")
+
+            print(f"\n[Summary] Experiment directory: {self.exp_dir}")
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -396,8 +643,23 @@ class Trainer:
 
     def train(self):
         start_step = self.step
+        max_training_steps = getattr(self.config, "max_training_steps", None)
+
+        if self.is_main_process and max_training_steps:
+            print(f"[Training] Will train for {max_training_steps} steps")
 
         while True:
+            # Check if we've reached max training steps
+            if max_training_steps and self.step >= max_training_steps:
+                if self.is_main_process:
+                    print(f"\n[Training] Reached max_training_steps ({max_training_steps}), stopping training...")
+                # Save final checkpoint
+                if not self.config.no_save:
+                    self.save()
+                # Run end-of-training tasks
+                self._on_training_end()
+                break
+
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
             # Train the generator
