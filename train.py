@@ -3,7 +3,7 @@ import os
 from omegaconf import OmegaConf
 import wandb
 
-from trainer import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer, ScoreDistillationDeepSpeedTrainer
+from trainer import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer
 
 
 def main():
@@ -38,10 +38,6 @@ def main():
         trainer = ODETrainer(config)
     elif config.trainer == "score_distillation":
         trainer = ScoreDistillationTrainer(config)
-    elif config.trainer == "score_distillation_deepspeed":
-        trainer = ScoreDistillationDeepSpeedTrainer(config)
-    else:
-        raise ValueError(f"Unknown trainer: {config.trainer}")
     trainer.train()
 
     wandb.finish()
