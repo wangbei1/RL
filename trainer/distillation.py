@@ -240,10 +240,10 @@ class Trainer:
             f.write("=" * 80 + "\n")
             # Write column headers
             if config.distribution_loss == "dmd_rl":
-                f.write(f"{'step':>8} | {'dmd_loss':>10} | {'rl_loss':>10} | {'reward_raw':>12} | {'reward_norm':>12} | {'total_loss':>12} | {'rl_enabled':>10} | {'critic_loss':>12} | {'type':>6}\n")
+                f.write(f"{'step':>8} | {'dmd_loss':>10} | {'rl_loss':>10} | {'reward_raw':>12} | {'reward_norm':>12} | {'total_loss':>12} | {'rl_enabled':>10}\n")
             else:
-                f.write(f"{'step':>8} | {'generator_loss':>14} | {'critic_loss':>12} | {'type':>6}\n")
-            f.write("-" * 110 + "\n")
+                f.write(f"{'step':>8} | {'generator_loss':>14} | {'critic_loss':>12}\n")
+            f.write("-" * 80 + "\n")
 
         print(f"[Logging] Experiment directory: {self.exp_dir}")
         print(f"[Logging] Log file: {self.log_file}")
@@ -251,24 +251,16 @@ class Trainer:
     def _log_to_file(self, step, generator_log_dict, critic_log_dict):
         """
         Write training metrics to local log file and store in history for plotting.
-        Called every step. When generator is not trained, generator_log_dict is empty.
         """
-        # Check if generator was trained this step
-        gen_trained = len(generator_log_dict) > 0
-
         # Store in history for plotting
         self.training_history["steps"].append(step)
 
         if self.config.distribution_loss == "dmd_rl":
-            # Use None for steps where generator wasn't trained (for cleaner plots)
-            if gen_trained:
-                dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
-                rl_loss = generator_log_dict.get("rl_loss", 0.0)
-                reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
-                reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
-                total_loss = generator_log_dict.get("total_generator_loss", 0.0)
-            else:
-                dmd_loss = rl_loss = reward_raw = reward_norm = total_loss = None
+            dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
+            rl_loss = generator_log_dict.get("rl_loss", 0.0)
+            reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
+            reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
+            total_loss = generator_log_dict.get("total_generator_loss", 0.0)
             rl_enabled = generator_log_dict.get("rl_enabled", False)
 
             self.training_history["dmd_loss"].append(dmd_loss)
@@ -277,12 +269,9 @@ class Trainer:
             self.training_history["rl_reward_normalized"].append(reward_norm)
             self.training_history["generator_loss"].append(total_loss)
         else:
-            if gen_trained:
-                gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
-                if isinstance(gen_loss, torch.Tensor):
-                    gen_loss = gen_loss.mean().item()
-            else:
-                gen_loss = None
+            gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
+            if isinstance(gen_loss, torch.Tensor):
+                gen_loss = gen_loss.mean().item()
             self.training_history["generator_loss"].append(gen_loss)
 
         critic_loss = critic_log_dict.get("critic_loss", torch.tensor(0.0))
@@ -295,27 +284,23 @@ class Trainer:
 
         with open(self.log_file, "a") as f:
             if self.config.distribution_loss == "dmd_rl":
-                if gen_trained:
-                    dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
-                    rl_loss = generator_log_dict.get("rl_loss", 0.0)
-                    reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
-                    reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
-                    total_loss = generator_log_dict.get("total_generator_loss", 0.0)
-                    rl_enabled = generator_log_dict.get("rl_enabled", False)
-                    f.write(f"{step:>8} | {dmd_loss:>10.4f} | {rl_loss:>10.4f} | {reward_raw:>12.4f} | {reward_norm:>12.4f} | {total_loss:>12.4f} | {str(rl_enabled):>10} | {critic_loss:>12.4f} | {'GEN':>6}\n")
-                else:
-                    f.write(f"{step:>8} | {'-':>10} | {'-':>10} | {'-':>12} | {'-':>12} | {'-':>12} | {'-':>10} | {critic_loss:>12.4f} | {'CRITIC':>6}\n")
+                dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
+                rl_loss = generator_log_dict.get("rl_loss", 0.0)
+                reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
+                reward_norm = generator_log_dict.get("rl_reward_normalized", 0.0)
+                total_loss = generator_log_dict.get("total_generator_loss", 0.0)
+                rl_enabled = generator_log_dict.get("rl_enabled", False)
+
+                f.write(f"{step:>8} | {dmd_loss:>10.4f} | {rl_loss:>10.4f} | {reward_raw:>12.4f} | {reward_norm:>12.4f} | {total_loss:>12.4f} | {str(rl_enabled):>10}\n")
             else:
+                gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
+                if isinstance(gen_loss, torch.Tensor):
+                    gen_loss = gen_loss.mean().item()
                 critic_loss_val = critic_log_dict.get("critic_loss", torch.tensor(0.0))
                 if isinstance(critic_loss_val, torch.Tensor):
                     critic_loss_val = critic_loss_val.mean().item()
-                if gen_trained:
-                    gen_loss = generator_log_dict.get("generator_loss", torch.tensor(0.0))
-                    if isinstance(gen_loss, torch.Tensor):
-                        gen_loss = gen_loss.mean().item()
-                    f.write(f"{step:>8} | {gen_loss:>14.4f} | {critic_loss_val:>12.4f} | {'GEN':>6}\n")
-                else:
-                    f.write(f"{step:>8} | {'-':>14} | {critic_loss_val:>12.4f} | {'CRITIC':>6}\n")
+
+                f.write(f"{step:>8} | {gen_loss:>14.4f} | {critic_loss_val:>12.4f}\n")
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -787,10 +772,9 @@ class Trainer:
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
 
-                # Log to local file (every step)
-                # When generator is not trained this step, pass empty dict
-                gen_log = generator_log_dict if TRAIN_GENERATOR else {}
-                self._log_to_file(self.step, gen_log, critic_log_dict)
+                # Log to local file
+                if TRAIN_GENERATOR:
+                    self._log_to_file(self.step, generator_log_dict, critic_log_dict)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
