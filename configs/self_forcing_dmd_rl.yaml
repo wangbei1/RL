@@ -59,12 +59,14 @@ weight_decay: 0.01
 
 # Data
 data_path: prompts/vidprom_filtered_extended.txt
-batch_size: 1
+batch_size: 1                                    # Per-GPU batch size
 
-# EMA
+# Gradient Accumulation & EMA
+# gradient_accumulation_steps = total_batch_size / (batch_size * world_size)
+# Example: 8 GPUs with batch_size=1, total_batch_size=64 -> accumulation_steps=8
+total_batch_size: 64                             # Effective total batch size
 ema_weight: 0.99
 ema_start_step: 200
-total_batch_size: 64
 log_iters: 50
 
 # Negative prompt for CFG

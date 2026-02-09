@@ -38,6 +38,15 @@ class Trainer:
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
 
+        # Calculate gradient accumulation steps
+        total_batch_size = getattr(config, "total_batch_size", config.batch_size * self.world_size)
+        self.gradient_accumulation_steps = total_batch_size // (config.batch_size * self.world_size)
+        if self.gradient_accumulation_steps < 1:
+            self.gradient_accumulation_steps = 1
+        if self.is_main_process:
+            print(f"[Gradient Accumulation] batch_size={config.batch_size}, world_size={self.world_size}, "
+                  f"total_batch_size={total_batch_size}, accumulation_steps={self.gradient_accumulation_steps}")
+
         # use a random seed for the training
         if config.seed == 0:
             random_seed = torch.randint(0, 10000000, (1,), device=self.device)
@@ -526,7 +535,15 @@ class Trainer:
 
             print(f"\n[Summary] Experiment directory: {self.exp_dir}")
 
-    def fwdbwd_one_step(self, batch, train_generator):
+    def fwdbwd_one_step(self, batch, train_generator, scale_loss=1):
+        """
+        Forward and backward pass for one micro-batch.
+
+        Args:
+            batch: Input batch
+            train_generator: If True, train generator; otherwise train critic
+            scale_loss: Divide loss by this value for gradient accumulation
+        """
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         if self.step % 20 == 0:
@@ -582,12 +599,12 @@ class Trainer:
                     initial_latent=image_latent if self.config.i2v else None
                 )
 
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
+            # Scale loss for gradient accumulation
+            scaled_loss = generator_loss / scale_loss
+            scaled_loss.backward()
 
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
+            # Store unscaled loss for logging
+            generator_log_dict.update({"generator_loss": generator_loss})
 
             return generator_log_dict
         else:
@@ -602,12 +619,12 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
+        # Scale loss for gradient accumulation
+        scaled_loss = critic_loss / scale_loss
+        scaled_loss.backward()
 
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
+        # Store unscaled loss for logging
+        critic_log_dict.update({"critic_loss": critic_loss})
 
         return critic_log_dict
 
@@ -662,25 +679,49 @@ class Trainer:
 
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
-            # Train the generator
+            # Train the generator with gradient accumulation
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
+
+                for accum_step in range(self.gradient_accumulation_steps):
+                    batch = next(self.dataloader)
+                    # Use no_sync for all but the last accumulation step to avoid gradient sync overhead
+                    if accum_step < self.gradient_accumulation_steps - 1:
+                        with self.model.generator.no_sync():
+                            extra = self.fwdbwd_one_step(batch, True, scale_loss=self.gradient_accumulation_steps)
+                    else:
+                        extra = self.fwdbwd_one_step(batch, True, scale_loss=self.gradient_accumulation_steps)
+                    extras_list.append(extra)
+
+                # Clip gradients after accumulation
+                generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm_generator)
                 generator_log_dict = merge_dict_list(extras_list)
+                generator_log_dict["generator_grad_norm"] = generator_grad_norm
+
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
 
-            # Train the critic
+            # Train the critic with gradient accumulation
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
+
+            for accum_step in range(self.gradient_accumulation_steps):
+                batch = next(self.dataloader)
+                # Use no_sync for all but the last accumulation step
+                if accum_step < self.gradient_accumulation_steps - 1:
+                    with self.model.fake_score.no_sync():
+                        extra = self.fwdbwd_one_step(batch, False, scale_loss=self.gradient_accumulation_steps)
+                else:
+                    extra = self.fwdbwd_one_step(batch, False, scale_loss=self.gradient_accumulation_steps)
+                extras_list.append(extra)
+
+            # Clip gradients after accumulation
+            critic_grad_norm = self.model.fake_score.clip_grad_norm_(self.max_grad_norm_critic)
             critic_log_dict = merge_dict_list(extras_list)
+            critic_log_dict["critic_grad_norm"] = critic_grad_norm
+
             self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update
