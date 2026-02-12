@@ -4,13 +4,13 @@ from typing import Optional, List, Union
 
 import pandas as pd
 import torch
-from prompt_template import build_prompt
+from VideoAlign.prompt_template import build_prompt
 # from qwen_vl_utils import process_vision_info
-from vision_process import process_vision_info
+from VideoAlign.vision_process import process_vision_info
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as F
 
-from utils import save_video
+from VideoAlign.utils import save_video
 
 @dataclass
 class DataConfig:

@@ -10,7 +10,7 @@ import torch
 from VideoAlign.vision_process import process_vision_info, smart_resize
 from torchvision import io, transforms
 
-from data import DataConfig
+from VideoAlign.data import DataConfig
 from VideoAlign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
 from VideoAlign.utils import load_model_from_checkpoint
 from VideoAlign.train_reward import create_model_and_processor
@@ -459,7 +459,7 @@ def get_video_tensor_for_reward(video_path, num_frames, max_pixels, sample_type=
         resized_height: resize 后的高度
         resized_width: resize 后的宽度
     """
-    from vision_process import smart_resize, round_by_factor, FRAME_FACTOR
+    from VideoAlign.vision_process import smart_resize, round_by_factor, FRAME_FACTOR
 
     # 1. 读取视频
     vframes, _, info = io.read_video(video_path, pts_unit='sec', output_format="TCHW")
@@ -900,6 +900,11 @@ class DifferentiableVideoReward:
         assert target_height % 28 == 0, f"target_height 必须是 28 的倍数，当前为 {target_height}"
         assert target_width % 28 == 0, f"target_width 必须是 28 的倍数，当前为 {target_width}"
 
+        # Trim to even number of frames (temporal_patch_size=2 requires even T)
+        T = vae_output.shape[0]
+        if T % 2 != 0:
+            vae_output = vae_output[:T - 1]
+
         # 1. 转换 VAE 输出到 pixel_values
         pixel_values = vae_output_to_pixel_values(
             vae_output,
@@ -939,7 +944,7 @@ class DifferentiableVideoReward:
         Qwen2-VL 的 processor 需要知道视频尺寸来插入正确数量的视频 token。
         我们通过创建一个假的视频张量（只用于获取正确的 token 数量）来实现。
         """
-        from prompt_template import build_prompt
+        from VideoAlign.prompt_template import build_prompt
 
         eval_dim = self.inferencer.data_config.eval_dim
         prompt_template_type = self.inferencer.data_config.prompt_template_type
@@ -993,7 +998,7 @@ class DifferentiableVideoReward:
         Returns:
             (target_height, target_width): 28 对齐的目标尺寸
         """
-        from vision_process import smart_resize, FRAME_FACTOR
+        from VideoAlign.vision_process import smart_resize, FRAME_FACTOR
 
         VIDEO_MIN_PIXELS = 128 * 28 * 28
         VIDEO_MAX_PIXELS = 768 * 28 * 28
