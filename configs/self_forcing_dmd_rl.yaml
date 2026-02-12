@@ -59,12 +59,9 @@ weight_decay: 0.01
 
 # Data
 data_path: prompts/vidprom_filtered_extended.txt
-batch_size: 1                                    # Per-GPU batch size
+batch_size: 1
 
-# Gradient Accumulation & EMA
-# gradient_accumulation_steps = total_batch_size / (batch_size * world_size)
-# Example: 8 GPUs with batch_size=1, total_batch_size=64 -> accumulation_steps=8
-total_batch_size: 64                             # Effective total batch size
+# EMA
 ema_weight: 0.99
 ema_start_step: 200
 log_iters: 50
@@ -103,6 +100,11 @@ rl_reward_normalize: true        # Whether to normalize rewards using running st
 rl_reward_scale: 1.0             # Scale factor applied after normalization
 rl_reward_baseline: 0.0          # Baseline subtracted from normalized reward
 rl_reward_ema_decay: 0.99        # EMA decay for running mean/std
+
+# Memory optimization for RL
+# Reward model gradient checkpointing is always enabled (via Qwen2VL API)
+rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
+vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
 
 # ============================================
 # LoRA configuration (optional, for stable training)
