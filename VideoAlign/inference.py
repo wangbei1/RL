@@ -7,14 +7,14 @@ import pandas as pd
 from torchvision.transforms import InterpolationMode
 
 import torch
-from vision_process import process_vision_info, smart_resize
+from VideoAlign.vision_process import process_vision_info, smart_resize
 from torchvision import io, transforms
 
 from data import DataConfig
-from utils import ModelConfig, PEFTLoraConfig, TrainingConfig
-from utils import load_model_from_checkpoint
-from train_reward import create_model_and_processor
-from prompt_template import build_prompt
+from VideoAlign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
+from VideoAlign.utils import load_model_from_checkpoint
+from VideoAlign.train_reward import create_model_and_processor
+from VideoAlign.prompt_template import build_prompt
 
 
 def load_configs_from_json(config_path):
@@ -289,19 +289,19 @@ import itertools
 import torch
 import torch.nn.functional as F
 import itertools
-from vision_process import process_vision_info
+from VideoAlign.vision_process import process_vision_info
 
 import torch
 
 import torch
 import torch.nn.functional as F
 import itertools
-from vision_process import process_vision_info
+from VideoAlign.vision_process import process_vision_info
 
 import torch
 import torch.nn.functional as F
 import itertools
-from vision_process import process_vision_info
+from VideoAlign.vision_process import process_vision_info
 
 import torch
 import torch.nn.functional as F
@@ -366,7 +366,7 @@ def differentiable_process_vlm_video_v446(video_tensor, processor):
 
 import torch
 import torch.nn.functional as F
-from vision_process import process_vision_info
+from VideoAlign.vision_process import process_vision_info
 
 def verify_v446_consistency(inferencer, video_path, prompt):
     print(">>> 正在获取官方输出...")
