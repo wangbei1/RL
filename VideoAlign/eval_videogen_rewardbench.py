@@ -9,8 +9,8 @@ from tqdm import tqdm
 
 import torch
 
-from inference import VideoVLMRewardInference
-from calc_accuracy import calc_accuracy_with_ties, calc_accuracy_without_ties
+from VideoAlign.inference import VideoVLMRewardInference
+from VideoAlign.calc_accuracy import calc_accuracy_with_ties, calc_accuracy_without_ties
 
 
 def convert_pair_to_single(df_pair_anno):
