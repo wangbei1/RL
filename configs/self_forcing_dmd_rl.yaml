@@ -3,7 +3,7 @@
 #
 # Key Features:
 # - DMD loss for distribution matching
-# - RL loss from video reward model (DifferentiableVideoReward)
+# - RL loss via REINFORCE with Gaussian perturbation (no backprop through reward model)
 # - LoRA support for stable training
 # - Cold start mechanism for RL
 #
@@ -94,17 +94,17 @@ rl_target_height: 336            # Target height for reward model (must be multi
 rl_target_width: 504             # Target width for reward model (must be multiple of 28)
 rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 
-# Reward normalization (for stable training)
-# The raw logits from reward model can have arbitrary scale, normalization helps
-rl_reward_normalize: true        # Whether to normalize rewards using running statistics
-rl_reward_scale: 1.0             # Scale factor applied after normalization
-rl_reward_baseline: 0.0          # Baseline subtracted from normalized reward
-rl_reward_ema_decay: 0.99        # EMA decay for running mean/std
+# REINFORCE parameters
+# Uses Gaussian perturbation + antithetic sampling to estimate reward gradient
+# without backpropping through VAE/reward model (saves significant GPU memory)
+rl_perturbation_sigma: 0.1      # Perturbation scale σ for finite difference gradient estimation
+rl_num_perturbations: 1          # Number of perturbation samples (higher = lower variance, more compute)
+rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics
 
 # Memory optimization for RL
-# Reward model gradient checkpointing is always enabled (via Qwen2VL API)
+# No gradient checkpointing needed: REINFORCE only uses forward passes on reward model
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
-vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
+vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking)
 
 # ============================================
 # LoRA configuration (optional, for stable training)

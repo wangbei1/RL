@@ -6,18 +6,28 @@ with Reinforcement Learning from video reward models.
 
 Loss: loss_gen = dmd_loss + rl_loss_weight * rl_loss
 
+RL approach: REINFORCE with Gaussian perturbation (zeroth-order gradient estimation).
+Instead of backpropping through VAE decoder and reward model (memory-intensive),
+we estimate the reward gradient via antithetic finite differences:
+
+    nabla_x R(x) ≈ (R(x+σε) - R(x-σε)) / (2σ) * ε
+
+Then construct a surrogate loss (same trick as DMD) whose analytical gradient
+equals the estimated reward gradient. This avoids storing activations in the
+VAE and reward model, significantly reducing GPU memory usage.
+
 Features:
-- RL loss computed from VAE-decoded videos using DifferentiableVideoReward
+- REINFORCE-style RL loss with Gaussian perturbation (no backprop through reward model)
 - Cold start: RL loss only participates after a specified number of training steps
-- Reward normalization support for stable training
-- Chunked VAE decoding with gradient checkpointing for memory efficiency
+- Reward EMA statistics for monitoring
+- Gradient normalization for stable training
+- Chunked VAE decoding (no gradient checkpointing needed) for memory efficiency
 - FSDP support for the reward model
 """
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint_utils
-from typing import Optional, Tuple
+from typing import Tuple
 
 from model.dmd import DMD
 
@@ -26,6 +36,9 @@ class DMDRL(DMD):
     """
     DMD + RL Model combining distribution matching distillation with
     reinforcement learning from video reward models.
+
+    Uses REINFORCE with Gaussian perturbation for the RL loss, avoiding
+    backpropagation through the VAE decoder and reward model.
     """
 
     def __init__(self, args, device):
@@ -46,12 +59,11 @@ class DMDRL(DMD):
         self.rl_reward_fsdp = getattr(args, "rl_reward_fsdp", False)
         self.vae_chunk_size = getattr(args, "vae_chunk_size", 0)  # 0 = no chunking
 
-        # Reward normalization configuration
-        self.rl_reward_normalize = getattr(args, "rl_reward_normalize", True)
-        self.rl_reward_scale = getattr(args, "rl_reward_scale", 1.0)
-        self.rl_reward_baseline = getattr(args, "rl_reward_baseline", 0.0)
+        # REINFORCE parameters
+        self.rl_perturbation_sigma = getattr(args, "rl_perturbation_sigma", 0.1)
+        self.rl_num_perturbations = getattr(args, "rl_num_perturbations", 1)
 
-        # Running statistics for reward normalization (EMA)
+        # Running statistics for reward monitoring (EMA)
         self.rl_reward_ema_mean = 0.0
         self.rl_reward_ema_std = 1.0
         self.rl_reward_ema_decay = getattr(args, "rl_reward_ema_decay", 0.99)
@@ -68,7 +80,8 @@ class DMDRL(DMD):
     def _initialize_reward_model(self):
         """
         Lazily initialize the reward model when RL is first enabled.
-        Enables gradient checkpointing and optional FSDP wrapping.
+        No gradient checkpointing needed: REINFORCE doesn't backprop through
+        the reward model, so no intermediate activations need to be stored.
         """
         if self._reward_model_initialized:
             return
@@ -85,28 +98,15 @@ class DMDRL(DMD):
             dtype=self.dtype
         )
 
-        # Freeze reward model parameters
-        # Gradients can still flow THROUGH the reward model back to generator
+        # Freeze reward model parameters (REINFORCE: no gradients needed at all)
         self._reward_model.inferencer.model.requires_grad_(False)
-
-        # Enable gradient checkpointing on the reward model (Qwen2VL supports this)
-        # This trades compute for memory: intermediate activations are freed during
-        # forward and recomputed during backward
-        reward_qwen_model = self._reward_model.inferencer.model
-        if hasattr(reward_qwen_model, 'gradient_checkpointing_enable'):
-            reward_qwen_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            print(f"[DMDRL] Reward model gradient checkpointing enabled")
-        else:
-            print(f"[DMDRL] Warning: reward model does not support gradient_checkpointing_enable")
 
         # Optional FSDP wrapping for the reward model
         if self.rl_reward_fsdp:
             self._fsdp_wrap_reward_model()
 
         self._reward_model_initialized = True
-        print(f"[DMDRL] Reward model initialized and frozen successfully")
+        print(f"[DMDRL] Reward model initialized and frozen (REINFORCE mode, no gradient checkpointing)")
 
     def _fsdp_wrap_reward_model(self):
         """
@@ -149,26 +149,11 @@ class DMDRL(DMD):
                                      (1 - self.rl_reward_ema_decay) * abs(delta)
             self.rl_reward_ema_std = max(self.rl_reward_ema_std, 0.1)
 
-    def _normalize_reward(self, reward: torch.Tensor, raw_reward_value: float) -> torch.Tensor:
-        if not self.rl_reward_normalize:
-            return reward * self.rl_reward_scale - self.rl_reward_baseline
-
-        self._update_reward_stats(raw_reward_value)
-
-        # Use detached stats to avoid second-order gradients
-        normalized = (reward - self.rl_reward_ema_mean) / self.rl_reward_ema_std
-        normalized = normalized * self.rl_reward_scale - self.rl_reward_baseline
-        return normalized
-
-    def _chunked_vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def _vae_decode_no_grad(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent to pixel space in temporal chunks with gradient checkpointing.
-
-        The VAE uses causal convolutions with an internal feature cache, so we use
-        cached_decode to maintain temporal coherence across chunks.
-
-        Each chunk's decode is wrapped in gradient checkpoint to free intermediate
-        activations during forward. They are recomputed during backward.
+        Decode latent to pixel space without gradient tracking.
+        Uses temporal chunking for memory efficiency but no gradient checkpointing
+        (since this runs under torch.no_grad()).
 
         Args:
             latent: [B, T, C, H, W] latent tensor
@@ -179,11 +164,8 @@ class DMDRL(DMD):
         B, T, C, H, W = latent.shape
         chunk_size = self.vae_chunk_size
 
-        # If no chunking or chunk_size covers all frames, fall back to checkpointed full decode
         if chunk_size <= 0 or chunk_size >= T:
-            def _full_decode(lat):
-                return self.vae.decode_to_pixel(lat)
-            return checkpoint_utils.checkpoint(_full_decode, latent, use_reentrant=False)
+            return self.vae.decode_to_pixel(latent)
 
         # Chunked decode using cached_decode to preserve temporal causality
         zs = latent.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
@@ -200,13 +182,7 @@ class DMDRL(DMD):
             for start in range(0, T, chunk_size):
                 end = min(start + chunk_size, T)
                 chunk = single[:, :, start:end, :, :]
-
-                # Wrap each chunk's decode in gradient checkpoint
-                decoded = checkpoint_utils.checkpoint(
-                    self.vae.model.cached_decode,
-                    chunk, scale,
-                    use_reentrant=False
-                )
+                decoded = self.vae.model.cached_decode(chunk, scale)
                 decoded = decoded.float().clamp_(-1, 1)
                 sample_chunks.append(decoded)
 
@@ -217,77 +193,141 @@ class DMDRL(DMD):
         output = output.permute(0, 2, 1, 3, 4)  # [B, T, C, H', W']
         return output
 
+    def _compute_single_reward(self, single_video: torch.Tensor, prompt: str) -> float:
+        """
+        Compute scalar reward for a single video sample.
+        Must be called under torch.no_grad() context.
+
+        Args:
+            single_video: [T, 3, H, W] pixel video tensor
+            prompt: text prompt string
+
+        Returns:
+            Scalar reward value (float)
+        """
+        rewards = self._reward_model.compute_reward_from_vae_output(
+            vae_output=single_video,
+            prompt=prompt,
+            target_height=self.rl_target_height,
+            target_width=self.rl_target_width
+        )
+
+        if self.rl_reward_type == "VQ":
+            return rewards[0, 0].item()
+        elif self.rl_reward_type == "MQ":
+            return rewards[0, 1].item()
+        elif self.rl_reward_type == "TA":
+            return rewards[0, 2].item()
+        else:  # overall
+            return rewards.sum().item()
+
+    def _compute_batch_reward(self, latent: torch.Tensor, text_prompts: list) -> list:
+        """
+        Compute per-sample rewards for a batch of latents.
+        Must be called under torch.no_grad() context.
+
+        Args:
+            latent: [B, T, C, H, W] latent tensor
+            text_prompts: list of text prompt strings
+
+        Returns:
+            List of scalar reward values (floats), one per sample
+        """
+        B = latent.shape[0]
+        pixel_video = self._vae_decode_no_grad(latent)
+
+        rewards = []
+        for i in range(B):
+            prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
+            r = self._compute_single_reward(pixel_video[i], prompt)
+            rewards.append(r)
+
+        return rewards
+
     def compute_rl_loss(
         self,
         latent: torch.Tensor,
         text_prompts: list,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Compute RL loss from generated latents.
+        Compute RL loss using REINFORCE with Gaussian perturbation.
 
-        Uses chunked VAE decoding with gradient checkpointing to reduce memory.
+        Instead of backpropping through VAE + Reward Model, we:
+        1. Sample perturbation ε ~ N(0, I)
+        2. Evaluate reward at (latent ± σε) under torch.no_grad() (antithetic sampling)
+        3. Estimate reward gradient: ∇R ≈ (R⁺ - R⁻) / (2σ) · ε
+        4. Construct surrogate loss (same trick as DMD) whose gradient = -∇R
+
+        Minimizing the surrogate loss pushes the generator toward higher reward.
 
         Args:
-            latent: Generated latent tensor [B, T, C, H, W]
+            latent: Generated latent tensor [B, T, C, H, W] (with grad_fn from generator)
             text_prompts: List of text prompts
 
         Returns:
-            rl_loss: Scalar tensor representing the RL loss (negative reward)
+            rl_loss: Scalar surrogate loss tensor (gradient flows back to generator)
             rl_log_dict: Dictionary containing logging information
         """
         if not self.rl_enabled or self._reward_model is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True), {
                 "rl_loss": 0.0,
                 "rl_reward_raw": 0.0,
-                "rl_reward_normalized": 0.0,
                 "rl_enabled": False
             }
 
-        batch_size = latent.shape[0]
+        B, T, C, H, W = latent.shape
+        sigma = self.rl_perturbation_sigma
 
-        # Decode latent to pixel space with chunked + checkpointed VAE decode
-        pixel_video = self._chunked_vae_decode(latent)
+        with torch.no_grad():
+            latent_detached = latent.detach()
+            pseudo_grad = torch.zeros_like(latent)
+            all_raw_rewards = []
 
-        # Compute rewards for each sample in the batch
-        total_reward = 0.0
-        raw_rewards_list = []
-        normalized_rewards_list = []
+            for k in range(self.rl_num_perturbations):
+                epsilon = torch.randn_like(latent)
 
-        for i in range(batch_size):
-            single_video = pixel_video[i]  # [T, 3, H, W]
-            prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
+                # Antithetic sampling: evaluate reward at latent ± σε
+                latent_plus = latent_detached + sigma * epsilon
+                latent_minus = latent_detached - sigma * epsilon
 
-            rewards = self._reward_model.compute_reward_from_vae_output(
-                vae_output=single_video,
-                prompt=prompt,
-                target_height=self.rl_target_height,
-                target_width=self.rl_target_width
-            )
+                rewards_plus = self._compute_batch_reward(latent_plus, text_prompts)
+                rewards_minus = self._compute_batch_reward(latent_minus, text_prompts)
 
-            if self.rl_reward_type == "VQ":
-                reward = rewards[0, 0]
-            elif self.rl_reward_type == "MQ":
-                reward = rewards[0, 1]
-            elif self.rl_reward_type == "TA":
-                reward = rewards[0, 2]
-            else:  # overall
-                reward = rewards.sum()
+                all_raw_rewards.extend(rewards_plus)
+                all_raw_rewards.extend(rewards_minus)
 
-            raw_reward_value = reward.detach().item()
-            raw_rewards_list.append(raw_reward_value)
+                # Per-sample finite difference gradient estimate:
+                # ∇_x R(x) ≈ (R(x+σε) - R(x-σε)) / (2σ) · ε
+                for i in range(B):
+                    diff = rewards_plus[i] - rewards_minus[i]
+                    pseudo_grad[i] += (diff / (2.0 * sigma)) * epsilon[i]
 
-            normalized_reward = self._normalize_reward(reward, raw_reward_value)
-            normalized_rewards_list.append(normalized_reward.detach().item())
+            pseudo_grad /= self.rl_num_perturbations
 
-            total_reward = total_reward + normalized_reward
+            # Update EMA reward statistics for monitoring
+            mean_reward = sum(all_raw_rewards) / len(all_raw_rewards)
+            self._update_reward_stats(mean_reward)
 
-        avg_reward = total_reward / batch_size
-        rl_loss = -avg_reward
+            # Normalize pseudo gradient (similar to DMD's gradient normalization)
+            # This stabilizes training regardless of reward scale
+            grad_norm = torch.abs(pseudo_grad).mean(dim=[1, 2, 3, 4], keepdim=True).clamp(min=1e-8)
+            pseudo_grad = pseudo_grad / grad_norm
+
+        # Surrogate loss (same trick as DMD):
+        #   loss = 0.5 * ||latent - (latent + pseudo_grad).detach()||²
+        #   ∂loss/∂latent = latent - (latent + pseudo_grad)_stopped = -pseudo_grad
+        #
+        # Since pseudo_grad ∝ ∇R (reward increase direction),
+        # optimizer step: θ -= lr * ∂loss/∂θ = lr * pseudo_grad · ∂latent/∂θ  → reward ↑
+        rl_loss = 0.5 * F.mse_loss(
+            latent.double(),
+            (latent.double() + pseudo_grad.double()).detach(),
+            reduction="mean"
+        )
 
         rl_log_dict = {
             "rl_loss": rl_loss.detach().item(),
-            "rl_reward_raw": sum(raw_rewards_list) / len(raw_rewards_list),
-            "rl_reward_normalized": sum(normalized_rewards_list) / len(normalized_rewards_list),
+            "rl_reward_raw": mean_reward,
             "rl_reward_ema_mean": self.rl_reward_ema_mean,
             "rl_reward_ema_std": self.rl_reward_ema_std,
             "rl_enabled": True
