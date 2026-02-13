@@ -94,6 +94,9 @@ torchrun --nnodes=8 --nproc_per_node=8 --rdzv_id=5235 \
 ```
 Our training run uses 600 iterations and completes in under 2 hours using 64 H100 GPUs. By implementing gradient accumulation, it should be possible to reproduce the results in less than 16 hours using 8 H100 GPUs.
 
+## RL Memory Notes
+For memory-focused RL training notes (including full-gradient-through-reward-model optimization strategies), see [docs/reward_model_fullgrad_memory.md](docs/reward_model_fullgrad_memory.md).
+
 ## Acknowledgements
 This codebase is built on top of the open-source implementation of [CausVid](https://github.com/tianweiy/CausVid) by [Tianwei Yin](https://tianweiy.github.io/) and the [Wan2.1](https://github.com/Wan-Video/Wan2.1) repo.
 
