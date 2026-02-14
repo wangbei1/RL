@@ -53,12 +53,13 @@ class DMDRL(DMD):
         # 0 = no sampling (use all frames)
         self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 10)
 
-        # Reward normalization configuration
-        self.rl_reward_normalize = getattr(args, "rl_reward_normalize", True)
-        self.rl_reward_scale = getattr(args, "rl_reward_scale", 1.0)
-        self.rl_reward_baseline = getattr(args, "rl_reward_baseline", 0.0)
+        # Reward normalization: use inference_config from reward model checkpoint
+        # (VQ_mean/std, MQ_mean/std, TA_mean/std) for proper z-score normalization
+        # These are loaded lazily when the reward model is initialized
+        self._reward_norm_mean = None  # [3] tensor: [VQ_mean, MQ_mean, TA_mean]
+        self._reward_norm_std = None   # [3] tensor: [VQ_std, MQ_std, TA_std]
 
-        # Running statistics for reward normalization (EMA)
+        # Running EMA for reward monitoring only (not used in loss computation)
         self.rl_reward_ema_mean = 0.0
         self.rl_reward_ema_std = 1.0
         self.rl_reward_ema_decay = getattr(args, "rl_reward_ema_decay", 0.99)
@@ -112,6 +113,25 @@ class DMDRL(DMD):
         if self.rl_reward_fsdp:
             self._fsdp_wrap_reward_model()
 
+        # Load normalization stats from inference_config in the checkpoint
+        inference_config = self._reward_model.inferencer.inference_config
+        if inference_config is not None:
+            self._reward_norm_mean = torch.tensor(
+                [inference_config['VQ_mean'], inference_config['MQ_mean'], inference_config['TA_mean']],
+                device=self.device, dtype=torch.float32
+            )
+            self._reward_norm_std = torch.tensor(
+                [inference_config['VQ_std'], inference_config['MQ_std'], inference_config['TA_std']],
+                device=self.device, dtype=torch.float32
+            )
+            print(f"[DMDRL] Reward normalization loaded from inference_config: "
+                  f"VQ({inference_config['VQ_mean']:.4f}±{inference_config['VQ_std']:.4f}), "
+                  f"MQ({inference_config['MQ_mean']:.4f}±{inference_config['MQ_std']:.4f}), "
+                  f"TA({inference_config['TA_mean']:.4f}±{inference_config['TA_std']:.4f})")
+        else:
+            print(f"[DMDRL] Warning: no inference_config found in checkpoint, "
+                  f"using raw logits without normalization")
+
         self._reward_model_initialized = True
         print(f"[DMDRL] Reward model initialized and frozen successfully")
         print(f"[DMDRL] Frame sampling: {self.rl_reward_num_frames} frames "
@@ -158,16 +178,28 @@ class DMDRL(DMD):
                                      (1 - self.rl_reward_ema_decay) * abs(delta)
             self.rl_reward_ema_std = max(self.rl_reward_ema_std, 0.1)
 
-    def _normalize_reward(self, reward: torch.Tensor, raw_reward_value: float) -> torch.Tensor:
-        if not self.rl_reward_normalize:
-            return reward * self.rl_reward_scale - self.rl_reward_baseline
+    def _normalize_logits(self, rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize raw reward logits [1, 3] using the inference_config from the
+        reward model checkpoint. This is a differentiable linear transform:
+            normalized[i] = (raw[i] - mean[i]) / std[i]
 
-        self._update_reward_stats(raw_reward_value)
+        After normalization, each dimension (VQ, MQ, TA) is a z-score centered
+        around 0 with unit variance, making them comparable and well-scaled for RL.
 
-        # Use detached stats to avoid second-order gradients
-        normalized = (reward - self.rl_reward_ema_mean) / self.rl_reward_ema_std
-        normalized = normalized * self.rl_reward_scale - self.rl_reward_baseline
-        return normalized
+        Args:
+            rewards: [1, 3] raw logits tensor (VQ, MQ, TA) with gradient
+
+        Returns:
+            normalized: [1, 3] z-score normalized tensor (gradient preserved)
+        """
+        if self._reward_norm_mean is None or self._reward_norm_std is None:
+            return rewards
+
+        # Differentiable z-score normalization: (x - mean) / std
+        mean = self._reward_norm_mean.to(device=rewards.device, dtype=rewards.dtype)
+        std = self._reward_norm_std.to(device=rewards.device, dtype=rewards.dtype)
+        return (rewards - mean.unsqueeze(0)) / std.unsqueeze(0)
 
     def _sample_frames(self, video: torch.Tensor) -> torch.Tensor:
         """
@@ -313,29 +345,37 @@ class DMDRL(DMD):
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
-            rewards = self._reward_model.compute_reward_from_vae_output(
+            raw_logits = self._reward_model.compute_reward_from_vae_output(
                 vae_output=sampled_video,
                 prompt=prompt,
                 target_height=self.rl_target_height,
                 target_width=self.rl_target_width
             )
 
+            # Apply z-score normalization from inference_config (differentiable)
+            normalized_logits = self._normalize_logits(raw_logits)
+
             if self.rl_reward_type == "VQ":
-                reward = rewards[0, 0]
+                reward = normalized_logits[0, 0]
+                raw_reward = raw_logits[0, 0].detach().item()
             elif self.rl_reward_type == "MQ":
-                reward = rewards[0, 1]
+                reward = normalized_logits[0, 1]
+                raw_reward = raw_logits[0, 1].detach().item()
             elif self.rl_reward_type == "TA":
-                reward = rewards[0, 2]
+                reward = normalized_logits[0, 2]
+                raw_reward = raw_logits[0, 2].detach().item()
             else:  # overall
-                reward = rewards.sum()
+                reward = normalized_logits.sum()
+                raw_reward = raw_logits.sum().detach().item()
 
-            raw_reward_value = reward.detach().item()
-            raw_rewards_list.append(raw_reward_value)
+            reward_value = reward.detach().item()
+            raw_rewards_list.append(raw_reward)
+            normalized_rewards_list.append(reward_value)
 
-            normalized_reward = self._normalize_reward(reward, raw_reward_value)
-            normalized_rewards_list.append(normalized_reward.detach().item())
+            # Update EMA for monitoring
+            self._update_reward_stats(reward_value)
 
-            total_reward = total_reward + normalized_reward
+            total_reward = total_reward + reward
 
         avg_reward = total_reward / batch_size
         rl_loss = -avg_reward
