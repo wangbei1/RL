@@ -10,7 +10,7 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - Reward normalization support for stable training
-- Chunked VAE decoding: all latent frames decoded in contiguous chunks for temporal coherence
+- Chunked VAE decoding via cached_decode: contiguous chunks with temporal cache for correct boundaries
 - Pixel-space frame sampling: only a configurable subset of decoded frames is sent to the reward model
 - Gradient checkpointing on reward model (Qwen2-VL)
 - FSDP support for the reward model
@@ -18,7 +18,6 @@ Features:
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint_utils
 from typing import Optional, Tuple
 
 from model.dmd import DMD
@@ -234,13 +233,15 @@ class DMDRL(DMD):
         """
         Decode all latent frames to pixel space in contiguous temporal chunks.
 
-        Preserves full temporal coherence by decoding ALL latent frames (no
-        latent-space sub-sampling). Each chunk is wrapped with gradient
-        checkpointing to trade compute for memory.
+        Uses the VAE's cached_decode for chunked processing: temporal conv
+        caches are maintained across chunks so boundary frames are decoded
+        correctly (no seam artifacts). This avoids torch.utils.checkpoint
+        which fails on the VAE due to mutable internal state (_feat_map)
+        causing tensor count mismatches during recomputation.
 
-        With vae_chunk_size=N, peak VAE memory is proportional to N latent
-        frames instead of all T. Frame sub-sampling happens AFTER decode in
-        pixel space, so the reward model sees truly contiguous frames.
+        With vae_chunk_size=N, peak VAE temporary buffer memory is proportional
+        to N latent frames. Autograd activations for all chunks are retained
+        for backward, but the chunking bounds peak forward allocation.
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
@@ -251,25 +252,26 @@ class DMDRL(DMD):
         B, T, C, H, W = latent.shape
         chunk_size = self.vae_chunk_size
 
-        def _decode(lat):
-            return self.vae.decode_to_pixel(lat)
-
         if chunk_size <= 0 or chunk_size >= T:
-            # No chunking: decode all at once with gradient checkpoint
-            return checkpoint_utils.checkpoint(
-                _decode, latent, use_reentrant=False
-            )
+            # No chunking: decode all at once
+            return self.vae.decode_to_pixel(latent)
 
-        # Decode in contiguous temporal chunks with per-chunk gradient checkpoint
+        # Use cached_decode: maintains temporal conv caches across chunks
+        # so chunk boundaries get correct context from the previous chunk.
+        # cached_decode requires B=1; fall back to full decode otherwise.
+        if B > 1:
+            return self.vae.decode_to_pixel(latent)
+
+        self.vae.model.clear_cache()
+
         pixel_chunks = []
         for start in range(0, T, chunk_size):
             end = min(start + chunk_size, T)
             chunk = latent[:, start:end]
-            pixel_chunk = checkpoint_utils.checkpoint(
-                _decode, chunk, use_reentrant=False
-            )
+            pixel_chunk = self.vae.decode_to_pixel(chunk, use_cache=True)
             pixel_chunks.append(pixel_chunk)
 
+        self.vae.model.clear_cache()
         return torch.cat(pixel_chunks, dim=1)
 
     def compute_rl_loss(
@@ -280,15 +282,11 @@ class DMDRL(DMD):
         """
         Compute RL loss from generated latents.
 
-        Memory-optimized pipeline:
-        1. Decode ALL latent frames via chunked VAE decode (preserves temporal coherence)
+        Pipeline:
+        1. Decode ALL latent frames via chunked VAE cached_decode
+           (preserves temporal coherence across chunk boundaries)
         2. Sub-sample pixel frames to rl_reward_num_frames
         3. Compute reward, return negative reward as loss
-
-        Key insight: decode_to_pixel (use_cache=False) calls model.decode which
-        clears cache at start/end, making it stateless and safe for checkpoint
-        recomputation. Chunked decode controls peak VAE memory via vae_chunk_size
-        while preserving temporal continuity for accurate MQ scoring.
 
         Gradients flow: reward → pixel frames → VAE → latent → generator
 
