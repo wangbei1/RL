@@ -3,7 +3,9 @@
 #
 # Key Features:
 # - DMD loss for distribution matching
-# - RL loss via REINFORCE with Gaussian perturbation (no backprop through reward model)
+# - RL loss from video reward model (DifferentiableVideoReward) with direct backprop
+# - Frame sampling to reduce reward model VRAM (e.g. 84 frames -> 10 frames)
+# - Gradient checkpointing on reward model + chunked VAE decode
 # - LoRA support for stable training
 # - Cold start mechanism for RL
 #
@@ -94,17 +96,20 @@ rl_target_height: 336            # Target height for reward model (must be multi
 rl_target_width: 504             # Target width for reward model (must be multiple of 28)
 rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 
-# REINFORCE parameters
-# Uses Gaussian perturbation + antithetic sampling to estimate reward gradient
-# without backpropping through VAE/reward model (saves significant GPU memory)
-rl_perturbation_sigma: 0.1      # Perturbation scale σ for finite difference gradient estimation
-rl_num_perturbations: 1          # Number of perturbation samples (higher = lower variance, more compute)
-rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics
+# Reward normalization (for stable training)
+# The raw logits from reward model can have arbitrary scale, normalization helps
+rl_reward_normalize: true        # Whether to normalize rewards using running statistics
+rl_reward_scale: 1.0             # Scale factor applied after normalization
+rl_reward_baseline: 0.0          # Baseline subtracted from normalized reward
+rl_reward_ema_decay: 0.99        # EMA decay for running mean/std
 
 # Memory optimization for RL
-# No gradient checkpointing needed: REINFORCE only uses forward passes on reward model
+rl_reward_num_frames: 10         # Number of frames to sample for reward model (0 = all frames)
+                                 # 21 latent frames -> 84 pixel frames -> sample 10 for reward
+                                 # Reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
-vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking)
+vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
+                                 # Reward model gradient checkpointing is always enabled (via Qwen2VL API)
 
 # ============================================
 # LoRA configuration (optional, for stable training)
