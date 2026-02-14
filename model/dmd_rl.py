@@ -201,98 +201,71 @@ class DMDRL(DMD):
         std = self._reward_norm_std.to(device=rewards.device, dtype=rewards.dtype)
         return (rewards - mean.unsqueeze(0)) / std.unsqueeze(0)
 
-    def _sample_frames(self, video: torch.Tensor) -> torch.Tensor:
+    def _sample_frames(self, video: torch.Tensor, num_frames: int = 0) -> torch.Tensor:
         """
-        Uniformly sample a subset of frames from the video for reward computation.
-        This reduces VRAM usage in the reward model (Qwen2-VL) significantly,
-        since attention cost is quadratic in the number of visual tokens.
-
-        The reward model requires an even number of frames (temporal_patch_size=2),
-        so the sampled count is rounded down to the nearest even number.
+        Uniformly sample a subset of frames from a video tensor.
+        Ensures an even number of frames (reward model requires temporal_patch_size=2).
 
         Args:
-            video: [T, C, H, W] pixel video tensor (with gradient)
+            video: [T, C, H, W] video tensor (with gradient)
+            num_frames: number of frames to sample (0 = use self.rl_reward_num_frames)
 
         Returns:
             sampled: [T_sampled, C, H, W] sampled frames (gradient preserved)
         """
         T = video.shape[0]
-        num_frames = self.rl_reward_num_frames
+        if num_frames <= 0:
+            num_frames = self.rl_reward_num_frames
 
-        # No sampling if disabled or not enough frames
         if num_frames <= 0 or num_frames >= T:
-            # Still ensure even frame count for reward model
             if T % 2 != 0:
                 video = video[:T - 1]
             return video
 
-        # Ensure even number of frames (reward model requires temporal_patch_size=2)
         num_frames = num_frames if num_frames % 2 == 0 else num_frames - 1
-        num_frames = max(num_frames, 4)  # Minimum 4 frames
+        num_frames = max(num_frames, 4)
 
-        # Uniform sampling using linspace (differentiable indexing)
         indices = torch.linspace(0, T - 1, num_frames).round().long()
-        sampled = video[indices]  # Simple indexing preserves gradients
+        return video[indices]
 
-        return sampled
-
-    def _chunked_vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def _sample_latent_frames(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent to pixel space in temporal chunks.
+        Sample frames in latent space BEFORE VAE decode.
 
-        The VAE uses causal convolutions with an internal feature cache, so we use
-        cached_decode to maintain temporal coherence across chunks.
+        This is the key memory optimization: instead of decoding all 21 latent
+        frames (~81 pixel frames) and then sampling 10, we sample a small number
+        of latent frames first and decode only those.
 
-        NOTE: cached_decode is STATEFUL (modifies internal cache as a side effect),
-        so it CANNOT be wrapped in torch.utils.checkpoint. Checkpoint requires the
-        function to be deterministic on recomputation, but the cache state differs
-        between forward and recomputation, causing tensor count mismatch errors.
-        Chunking itself already reduces peak memory by limiting per-chunk size.
+        The VAE has 4x temporal compression (2 layers of 2x upsampling), so
+        N latent frames decode to ~4N pixel frames. To get rl_reward_num_frames
+        pixel frames, we need ceil(rl_reward_num_frames / 4) + 1 latent frames.
+
+        Example: rl_reward_num_frames=10 → 4 latent frames → ~16 pixel frames
+        → sub-sample to 10 in pixel space. Memory reduction: ~5x.
 
         Args:
-            latent: [B, T, C, H, W] latent tensor
+            latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
 
         Returns:
-            pixel_video: [B, T, 3, H', W'] decoded pixel video
+            sampled: [B, T_sampled, C, H, W] sampled latent frames
         """
         B, T, C, H, W = latent.shape
-        chunk_size = self.vae_chunk_size
+        num_pixel_frames = self.rl_reward_num_frames
 
-        # If no chunking or chunk_size covers all frames, fall back to checkpointed full decode
-        # decode_to_pixel is stateless (no cache), so checkpoint is safe here
-        if chunk_size <= 0 or chunk_size >= T:
-            def _full_decode(lat):
-                return self.vae.decode_to_pixel(lat)
-            return checkpoint_utils.checkpoint(_full_decode, latent, use_reentrant=False)
+        if num_pixel_frames <= 0:
+            return latent
 
-        # Chunked decode using cached_decode to preserve temporal causality
-        # No checkpoint here — cached_decode is stateful and incompatible with recomputation
-        zs = latent.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
-        device, dtype = latent.device, latent.dtype
-        scale = [self.vae.mean.to(device=device, dtype=dtype),
-                 1.0 / self.vae.std.to(device=device, dtype=dtype)]
+        # VAE temporal compression is 4x (temperal_upsample=[False, True, True])
+        # N latent frames → ~4N pixel frames
+        temporal_factor = 4
+        num_latent = (num_pixel_frames + temporal_factor - 1) // temporal_factor + 1
+        num_latent = max(num_latent, 2)
 
-        decoded_chunks = []
-        for b in range(B):
-            single = zs[b:b+1]  # [1, C, T, H, W]
-            self.vae.model.clear_cache()
-            sample_chunks = []
+        if num_latent >= T:
+            return latent
 
-            for start in range(0, T, chunk_size):
-                end = min(start + chunk_size, T)
-                chunk = single[:, :, start:end, :, :]
-
-                # Direct cached_decode without checkpoint
-                decoded = self.vae.model.cached_decode(chunk, scale)
-                decoded = decoded.float().clamp_(-1, 1)
-                sample_chunks.append(decoded)
-
-            self.vae.model.clear_cache()
-            decoded_chunks.append(torch.cat(sample_chunks, dim=2))  # [1, C, T_full, H', W']
-
-        output = torch.cat(decoded_chunks, dim=0)  # [B, C, T, H', W']
-        output = output.permute(0, 2, 1, 3, 4)  # [B, T, C, H', W']
-        return output
+        indices = torch.linspace(0, T - 1, num_latent).round().long()
+        return latent[:, indices]
 
     def compute_rl_loss(
         self,
@@ -302,13 +275,18 @@ class DMDRL(DMD):
         """
         Compute RL loss from generated latents.
 
-        Pipeline:
-        1. Decode latents to pixel space via chunked + checkpointed VAE decode
-        2. Sample a subset of frames (rl_reward_num_frames) to reduce reward model cost
-        3. Compute reward using DifferentiableVideoReward
-        4. Return negative (normalized) reward as loss
+        Memory-optimized pipeline:
+        1. Sample frames in LATENT space (21 → ~4 latent frames)
+        2. Decode sampled latent via stateless decode_to_pixel + gradient checkpoint
+        3. Sub-sample pixel frames to rl_reward_num_frames
+        4. Compute reward, return negative reward as loss
 
-        Gradients flow: reward model → sampled pixel frames → VAE → latent → generator
+        Key insight: decode_to_pixel (use_cache=False) calls model.decode which
+        clears cache at start/end, making it stateless and safe for checkpoint
+        recomputation. Combined with latent-space sampling, this reduces VAE
+        decode memory by ~5x compared to decoding all frames.
+
+        Gradients flow: reward → pixel frames → VAE → sampled latent → generator
 
         Args:
             latent: Generated latent tensor [B, T, C, H, W]
@@ -328,8 +306,18 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Decode latent to pixel space with chunked + checkpointed VAE decode
-        pixel_video = self._chunked_vae_decode(latent)
+        # Step 1: Sample frames in latent space BEFORE VAE decode
+        # e.g., 21 latent frames → 4 latent frames (saves ~5x VAE decode memory)
+        sampled_latent = self._sample_latent_frames(latent)
+
+        # Step 2: Decode sampled latent frames to pixel space
+        # decode_to_pixel is stateless (clears cache internally), so gradient
+        # checkpoint recomputation is deterministic — no tensor count mismatch
+        def _decode(lat):
+            return self.vae.decode_to_pixel(lat)
+        pixel_video = checkpoint_utils.checkpoint(
+            _decode, sampled_latent, use_reentrant=False
+        )
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
@@ -337,11 +325,10 @@ class DMDRL(DMD):
         normalized_rewards_list = []
 
         for i in range(batch_size):
-            single_video = pixel_video[i]  # [T, 3, H, W]
+            single_video = pixel_video[i]  # [T_decoded, 3, H, W]
 
-            # Sample frames before passing to reward model
-            # This is the key memory optimization: 84 frames -> 10 frames
-            # reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
+            # Step 3: Sub-sample pixel frames for reward model
+            # After 4x temporal upsample, ~4 latent → ~16 pixel frames → sample 10
             sampled_video = self._sample_frames(single_video)
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
