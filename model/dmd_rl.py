@@ -238,13 +238,16 @@ class DMDRL(DMD):
 
     def _chunked_vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent to pixel space in temporal chunks with gradient checkpointing.
+        Decode latent to pixel space in temporal chunks.
 
         The VAE uses causal convolutions with an internal feature cache, so we use
         cached_decode to maintain temporal coherence across chunks.
 
-        Each chunk's decode is wrapped in gradient checkpoint to free intermediate
-        activations during forward. They are recomputed during backward.
+        NOTE: cached_decode is STATEFUL (modifies internal cache as a side effect),
+        so it CANNOT be wrapped in torch.utils.checkpoint. Checkpoint requires the
+        function to be deterministic on recomputation, but the cache state differs
+        between forward and recomputation, causing tensor count mismatch errors.
+        Chunking itself already reduces peak memory by limiting per-chunk size.
 
         Args:
             latent: [B, T, C, H, W] latent tensor
@@ -256,12 +259,14 @@ class DMDRL(DMD):
         chunk_size = self.vae_chunk_size
 
         # If no chunking or chunk_size covers all frames, fall back to checkpointed full decode
+        # decode_to_pixel is stateless (no cache), so checkpoint is safe here
         if chunk_size <= 0 or chunk_size >= T:
             def _full_decode(lat):
                 return self.vae.decode_to_pixel(lat)
             return checkpoint_utils.checkpoint(_full_decode, latent, use_reentrant=False)
 
         # Chunked decode using cached_decode to preserve temporal causality
+        # No checkpoint here — cached_decode is stateful and incompatible with recomputation
         zs = latent.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
         device, dtype = latent.device, latent.dtype
         scale = [self.vae.mean.to(device=device, dtype=dtype),
@@ -277,12 +282,8 @@ class DMDRL(DMD):
                 end = min(start + chunk_size, T)
                 chunk = single[:, :, start:end, :, :]
 
-                # Wrap each chunk's decode in gradient checkpoint
-                decoded = checkpoint_utils.checkpoint(
-                    self.vae.model.cached_decode,
-                    chunk, scale,
-                    use_reentrant=False
-                )
+                # Direct cached_decode without checkpoint
+                decoded = self.vae.model.cached_decode(chunk, scale)
                 decoded = decoded.float().clamp_(-1, 1)
                 sample_chunks.append(decoded)
 
