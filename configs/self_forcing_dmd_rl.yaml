@@ -102,12 +102,13 @@ rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (logging only)
 
 # Memory optimization for RL
-rl_reward_num_frames: 10         # Number of frames to sample for reward model (0 = all frames)
-                                 # 21 latent frames -> 84 pixel frames -> sample 10 for reward
-                                 # Reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
+rl_reward_num_frames: 10         # Number of pixel frames to sample for reward model (0 = all frames)
+                                 # Sub-sampling happens AFTER VAE decode to preserve temporal coherence
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
-vae_chunk_size: 5                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
-                                 # Reward model gradient checkpointing is always enabled (via Qwen2VL API)
+vae_chunk_size: 5                # Number of latent frames to decode per chunk (0 = decode all at once)
+                                 # All latent frames are decoded in contiguous chunks (no latent sub-sampling)
+                                 # Each chunk is gradient-checkpointed; smaller = less peak VAE memory
+                                 # Example: 21 latent frames, chunk_size=5 → 5 chunks decoded sequentially
 
 # ============================================
 # LoRA configuration (optional, for stable training)

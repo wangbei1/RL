@@ -10,8 +10,8 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - Reward normalization support for stable training
-- Frame sampling: only a configurable subset of frames is sent to the reward model
-- Chunked VAE decoding with gradient checkpointing for memory efficiency
+- Chunked VAE decoding: all latent frames decoded in contiguous chunks for temporal coherence
+- Pixel-space frame sampling: only a configurable subset of decoded frames is sent to the reward model
 - Gradient checkpointing on reward model (Qwen2-VL)
 - FSDP support for the reward model
 """
@@ -134,7 +134,9 @@ class DMDRL(DMD):
 
         self._reward_model_initialized = True
         print(f"[DMDRL] Reward model initialized and frozen successfully")
-        print(f"[DMDRL] Frame sampling: {self.rl_reward_num_frames} frames "
+        print(f"[DMDRL] VAE chunk decode: vae_chunk_size={self.vae_chunk_size} "
+              f"(0 = decode all at once)")
+        print(f"[DMDRL] Pixel-space frame sampling: {self.rl_reward_num_frames} frames "
               f"(0 = all frames)")
 
     def _fsdp_wrap_reward_model(self):
@@ -228,44 +230,47 @@ class DMDRL(DMD):
         indices = torch.linspace(0, T - 1, num_frames).round().long()
         return video[indices]
 
-    def _sample_latent_frames(self, latent: torch.Tensor) -> torch.Tensor:
+    def _chunk_decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Sample frames in latent space BEFORE VAE decode.
+        Decode all latent frames to pixel space in contiguous temporal chunks.
 
-        This is the key memory optimization: instead of decoding all 21 latent
-        frames (~81 pixel frames) and then sampling 10, we sample a small number
-        of latent frames first and decode only those.
+        Preserves full temporal coherence by decoding ALL latent frames (no
+        latent-space sub-sampling). Each chunk is wrapped with gradient
+        checkpointing to trade compute for memory.
 
-        The VAE has 4x temporal compression (2 layers of 2x upsampling), so
-        N latent frames decode to ~4N pixel frames. To get rl_reward_num_frames
-        pixel frames, we need ceil(rl_reward_num_frames / 4) + 1 latent frames.
-
-        Example: rl_reward_num_frames=10 → 4 latent frames → ~16 pixel frames
-        → sub-sample to 10 in pixel space. Memory reduction: ~5x.
+        With vae_chunk_size=N, peak VAE memory is proportional to N latent
+        frames instead of all T. Frame sub-sampling happens AFTER decode in
+        pixel space, so the reward model sees truly contiguous frames.
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
 
         Returns:
-            sampled: [B, T_sampled, C, H, W] sampled latent frames
+            pixel_video: [B, T_pixel, C, H, W] decoded video
         """
         B, T, C, H, W = latent.shape
-        num_pixel_frames = self.rl_reward_num_frames
+        chunk_size = self.vae_chunk_size
 
-        if num_pixel_frames <= 0:
-            return latent
+        def _decode(lat):
+            return self.vae.decode_to_pixel(lat)
 
-        # VAE temporal compression is 4x (temperal_upsample=[False, True, True])
-        # N latent frames → ~4N pixel frames
-        temporal_factor = 4
-        num_latent = (num_pixel_frames + temporal_factor - 1) // temporal_factor + 1
-        num_latent = max(num_latent, 2)
+        if chunk_size <= 0 or chunk_size >= T:
+            # No chunking: decode all at once with gradient checkpoint
+            return checkpoint_utils.checkpoint(
+                _decode, latent, use_reentrant=False
+            )
 
-        if num_latent >= T:
-            return latent
+        # Decode in contiguous temporal chunks with per-chunk gradient checkpoint
+        pixel_chunks = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk = latent[:, start:end]
+            pixel_chunk = checkpoint_utils.checkpoint(
+                _decode, chunk, use_reentrant=False
+            )
+            pixel_chunks.append(pixel_chunk)
 
-        indices = torch.linspace(0, T - 1, num_latent).round().long()
-        return latent[:, indices]
+        return torch.cat(pixel_chunks, dim=1)
 
     def compute_rl_loss(
         self,
@@ -276,17 +281,16 @@ class DMDRL(DMD):
         Compute RL loss from generated latents.
 
         Memory-optimized pipeline:
-        1. Sample frames in LATENT space (21 → ~4 latent frames)
-        2. Decode sampled latent via stateless decode_to_pixel + gradient checkpoint
-        3. Sub-sample pixel frames to rl_reward_num_frames
-        4. Compute reward, return negative reward as loss
+        1. Decode ALL latent frames via chunked VAE decode (preserves temporal coherence)
+        2. Sub-sample pixel frames to rl_reward_num_frames
+        3. Compute reward, return negative reward as loss
 
         Key insight: decode_to_pixel (use_cache=False) calls model.decode which
         clears cache at start/end, making it stateless and safe for checkpoint
-        recomputation. Combined with latent-space sampling, this reduces VAE
-        decode memory by ~5x compared to decoding all frames.
+        recomputation. Chunked decode controls peak VAE memory via vae_chunk_size
+        while preserving temporal continuity for accurate MQ scoring.
 
-        Gradients flow: reward → pixel frames → VAE → sampled latent → generator
+        Gradients flow: reward → pixel frames → VAE → latent → generator
 
         Args:
             latent: Generated latent tensor [B, T, C, H, W]
@@ -306,18 +310,10 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Step 1: Sample frames in latent space BEFORE VAE decode
-        # e.g., 21 latent frames → 4 latent frames (saves ~5x VAE decode memory)
-        sampled_latent = self._sample_latent_frames(latent)
-
-        # Step 2: Decode sampled latent frames to pixel space
-        # decode_to_pixel is stateless (clears cache internally), so gradient
-        # checkpoint recomputation is deterministic — no tensor count mismatch
-        def _decode(lat):
-            return self.vae.decode_to_pixel(lat)
-        pixel_video = checkpoint_utils.checkpoint(
-            _decode, sampled_latent, use_reentrant=False
-        )
+        # Step 1: Decode ALL latent frames to pixel space in contiguous chunks
+        # Each chunk is gradient-checkpointed; vae_chunk_size controls peak memory
+        # e.g., vae_chunk_size=5: decode 5 latent frames at a time
+        pixel_video = self._chunk_decode_latent(latent)
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
@@ -327,8 +323,8 @@ class DMDRL(DMD):
         for i in range(batch_size):
             single_video = pixel_video[i]  # [T_decoded, 3, H, W]
 
-            # Step 3: Sub-sample pixel frames for reward model
-            # After 4x temporal upsample, ~4 latent → ~16 pixel frames → sample 10
+            # Step 2: Sub-sample pixel frames for reward model
+            # Full decode produces ~81 pixel frames → uniformly sample 10
             sampled_video = self._sample_frames(single_video)
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
