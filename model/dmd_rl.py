@@ -10,7 +10,7 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - Reward normalization support for stable training
-- Chunked VAE decoding via cached_decode: contiguous chunks with temporal cache for correct boundaries
+- VAE decoding with gradient checkpointing for memory efficiency
 - Pixel-space frame sampling: only a configurable subset of decoded frames is sent to the reward model
 - Gradient checkpointing on reward model (Qwen2-VL)
 - FSDP support for the reward model
@@ -18,6 +18,7 @@ Features:
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint_utils
 from typing import Optional, Tuple
 
 from model.dmd import DMD
@@ -229,50 +230,27 @@ class DMDRL(DMD):
         indices = torch.linspace(0, T - 1, num_frames).round().long()
         return video[indices]
 
-    def _chunk_decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+    def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode all latent frames to pixel space in contiguous temporal chunks.
+        Decode all latent frames to pixel space with gradient checkpointing.
 
-        Uses the VAE's cached_decode for chunked processing: temporal conv
-        caches are maintained across chunks so boundary frames are decoded
-        correctly (no seam artifacts). This avoids torch.utils.checkpoint
-        which fails on the VAE due to mutable internal state (_feat_map)
-        causing tensor count mismatches during recomputation.
-
-        With vae_chunk_size=N, peak VAE temporary buffer memory is proportional
-        to N latent frames. Autograd activations for all chunks are retained
-        for backward, but the chunking bounds peak forward allocation.
+        Single decode() call wrapped in checkpoint — same pattern as the
+        proven latent-sampling approach. decode() is self-contained
+        (clear_cache at start/end), so forward and recomputation produce
+        identical tensor counts.
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
 
         Returns:
-            pixel_video: [B, T_pixel, C, H, W] decoded video
+            pixel_video: [B, T_pixel, C, H, W] decoded video (~81 frames for T=21)
         """
-        B, T, C, H, W = latent.shape
-        chunk_size = self.vae_chunk_size
+        def _decode(lat):
+            return self.vae.decode_to_pixel(lat)
 
-        if chunk_size <= 0 or chunk_size >= T:
-            # No chunking: decode all at once
-            return self.vae.decode_to_pixel(latent)
-
-        # Use cached_decode: maintains temporal conv caches across chunks
-        # so chunk boundaries get correct context from the previous chunk.
-        # cached_decode requires B=1; fall back to full decode otherwise.
-        if B > 1:
-            return self.vae.decode_to_pixel(latent)
-
-        self.vae.model.clear_cache()
-
-        pixel_chunks = []
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            chunk = latent[:, start:end]
-            pixel_chunk = self.vae.decode_to_pixel(chunk, use_cache=True)
-            pixel_chunks.append(pixel_chunk)
-
-        self.vae.model.clear_cache()
-        return torch.cat(pixel_chunks, dim=1)
+        return checkpoint_utils.checkpoint(
+            _decode, latent, use_reentrant=False
+        )
 
     def compute_rl_loss(
         self,
@@ -283,8 +261,8 @@ class DMDRL(DMD):
         Compute RL loss from generated latents.
 
         Pipeline:
-        1. Decode ALL latent frames via chunked VAE cached_decode
-           (preserves temporal coherence across chunk boundaries)
+        1. Decode all latent frames via checkpoint(decode()) — all 21 latent
+           frames decoded in one self-contained decode() call
         2. Sub-sample pixel frames to rl_reward_num_frames
         3. Compute reward, return negative reward as loss
 
@@ -308,10 +286,10 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Step 1: Decode ALL latent frames to pixel space in contiguous chunks
-        # Each chunk is gradient-checkpointed; vae_chunk_size controls peak memory
-        # e.g., vae_chunk_size=5: decode 5 latent frames at a time
-        pixel_video = self._chunk_decode_latent(latent)
+        # Step 1: Decode all latent frames to pixel space
+        # Single decode() + checkpoint: VAE intermediate activations freed,
+        # only latent input and pixel output (~81 frames) retained
+        pixel_video = self._decode_latent(latent)
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
