@@ -103,8 +103,9 @@ rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (l
 
 # Memory optimization for RL
 rl_reward_num_frames: 10         # Number of pixel frames to sample for reward model (0 = all frames)
-                                 # All 21 latent frames are decoded to ~81 pixel frames (with checkpoint),
-                                 # then uniformly sub-sampled to this many frames for the reward model
+                                 # Decoded pixel frames are uniformly sub-sampled to this many
+vae_chunk_size: 5                # Latent frames per decode chunk (0 = all at once)
+                                 # Each chunk is checkpoint(decode()); limits peak VAE activation memory
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
 
 # ============================================
