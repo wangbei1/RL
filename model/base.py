@@ -76,8 +76,8 @@ class BaseModel(nn.Module):
                 timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-        # Apply LoRA to generator if enabled
-        self._apply_lora_if_enabled(args)
+        # Note: LoRA is applied by the trainer AFTER checkpoint loading.
+        # (PEFT wrapping changes state_dict keys, so base weights must be loaded first.)
 
     def _apply_lora_if_enabled(self, args):
         """
