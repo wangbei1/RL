@@ -3,6 +3,7 @@ import logging
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.checkpoint import extract_model_state_dict
 from utils.misc import (
     set_seed,
     merge_dict_list
@@ -169,11 +170,9 @@ class Trainer:
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
             print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
+            checkpoint = torch.load(config.generator_ckpt, map_location="cpu")
+            state_dict, key = extract_model_state_dict(checkpoint)
+            print(f"Using checkpoint key: {key}")
             self.model.generator.load_state_dict(
                 state_dict, strict=True
             )
