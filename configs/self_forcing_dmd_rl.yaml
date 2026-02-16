@@ -4,16 +4,16 @@
 # Key Features:
 # - DMD loss for distribution matching
 # - RL loss from video reward model (DifferentiableVideoReward) with direct backprop
-# - Context-window VAE decode: each target pixel decoded with 4 causal context latents
-# - Gradient checkpointing on reward model + per-target checkpoint on VAE decode
-# - LoRA support for stable training
+# - VAE decode with gradient checkpointing + pixel frame sampling
+# - Gradient checkpointing on reward model
+# - LoRA on generator (q, k, v, o) for memory-efficient training
 # - Cold start mechanism for RL
 #
 # Usage:
 #   torchrun --nproc_per_node=8 train.py --config configs/self_forcing_dmd_rl.yaml
 
-# Generator checkpoint (pre-trained)
-generator_ckpt: checkpoints/ode_init.pt
+# Generator checkpoint (pre-trained self-forcing DMD)
+generator_ckpt: /home/zdmaogroup/wubin/RL1-claude-optimize-memory-frame-sampling-FrPp8/checkpoints/self_forcing_dmd.pt
 
 # FSDP wrap strategies
 generator_fsdp_wrap_strategy: size
@@ -102,22 +102,21 @@ rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (logging only)
 
 # Memory optimization for RL
-rl_reward_num_frames: 10         # Number of pixel frames uniformly sampled from the 81-frame timeline
-                                 # Each target pixel decoded with 4 causal context latents via checkpoint
+rl_reward_num_frames: 10         # Number of pixel frames uniformly sub-sampled for reward model (0 = all)
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
 
 # ============================================
 # LoRA configuration (optional, for stable training)
 # ============================================
-use_lora: false                  # Set to true to enable LoRA
+use_lora: true                   # Enable LoRA for memory-efficient training
 lora_rank: 16                    # Rank of LoRA matrices
 lora_alpha: 32                   # Alpha parameter for LoRA scaling
 lora_dropout: 0.0                # Dropout probability for LoRA layers
-# lora_target_modules:           # Uncomment to specify custom target modules
-#   - q_proj
-#   - k_proj
-#   - v_proj
-#   - o_proj
+lora_target_modules:             # Wan model attention layer names
+  - q
+  - k
+  - v
+  - o
 
 # Other settings
 gradient_checkpointing: true
