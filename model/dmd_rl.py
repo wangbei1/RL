@@ -10,8 +10,10 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - Reward normalization support for stable training
-- VAE decoding with gradient checkpointing for memory efficiency
-- Pixel-space frame sampling: only a configurable subset of decoded frames is sent to the reward model
+- Context-window VAE decode: for each target pixel frame (uniformly sampled from
+  the full pixel timeline), decode its source latent with 4 preceding causal context
+  frames via checkpoint(decode([L-4, ..., L])). 4 warmup frames flush the cold start
+  from every CACHE_T=2 cache, making output identical to full decode in practice.
 - Gradient checkpointing on reward model (Qwen2-VL)
 - FSDP support for the reward model
 """
@@ -46,7 +48,6 @@ class DMDRL(DMD):
 
         # Memory optimization options
         self.rl_reward_fsdp = getattr(args, "rl_reward_fsdp", False)
-        self.vae_chunk_size = getattr(args, "vae_chunk_size", 0)  # 0 = no chunking
 
         # Frame sampling: only send a subset of frames to the reward model
         # This dramatically reduces VRAM since Qwen2-VL attention is quadratic in token count
@@ -134,10 +135,8 @@ class DMDRL(DMD):
 
         self._reward_model_initialized = True
         print(f"[DMDRL] Reward model initialized and frozen successfully")
-        print(f"[DMDRL] VAE chunk decode: vae_chunk_size={self.vae_chunk_size} "
-              f"(0 = decode all at once)")
-        print(f"[DMDRL] Pixel-space frame sampling: {self.rl_reward_num_frames} frames "
-              f"(0 = all frames)")
+        print(f"[DMDRL] Context-window decode: {self.rl_reward_num_frames} target pixel frames "
+              f"(each with 4 causal context latents, checkpoint per target)")
 
     def _fsdp_wrap_reward_model(self):
         """
@@ -232,41 +231,83 @@ class DMDRL(DMD):
 
     def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent frames to pixel space in contiguous chunks, each
-        wrapped in its own gradient checkpoint.
+        Decode only the pixel frames needed for the reward model, using
+        the pixel→latent mapping to decode each target frame with 4 causal
+        context frames.
 
-        Each chunk calls decode() which is self-contained (clear_cache at
-        start/end), so checkpoint forward and recomputation produce identical
-        tensor counts. Chunking limits peak VAE activation memory to one
-        chunk's worth instead of all frames at once.
+        VAE temporal structure: latent 0 → 1 pixel, latent k (k≥1) → 4 pixels.
+        Full decode of T latent frames → 1 + 4*(T-1) pixel frames.
+
+        For each target pixel (uniformly sampled), we decode its source latent
+        with 4 preceding context frames: checkpoint(decode([L-4, ..., L])).
+        Only the target pixel frame is returned from the checkpoint boundary,
+        so context frame activations are freed.
+
+        Why 4 context frames: CACHE_T=2, so each CausalConv3d layer caches the
+        last 2 frames. With 4 warmup frames, the cold-started frame 0 is fully
+        evicted from every layer's cache by the time we reach the target, making
+        the output identical to full decode in practice.
+
+        - Accurate: target frame has >CACHE_T warmup, cold start fully flushed
+        - Memory-efficient: only num_frames pixel frames retained
+        - Checkpoint-safe: each decode() is self-contained (clear_cache)
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
 
         Returns:
-            pixel_video: [B, T_pixel, C, H, W] decoded video
+            pixel_frames: [B, num_frames, C, H, W] uniformly sampled pixel frames
         """
-        B, T, C, H, W = latent.shape
-        chunk_size = self.vae_chunk_size
+        B, T_lat, C, H, W = latent.shape
+        T_pixel = 1 + 4 * (T_lat - 1)  # e.g., 81 for T_lat=21
 
-        def _decode(lat):
-            return self.vae.decode_to_pixel(lat)
+        num_frames = self.rl_reward_num_frames
+        if num_frames <= 0 or num_frames >= T_pixel:
+            num_frames = T_pixel
+        num_frames = num_frames if num_frames % 2 == 0 else num_frames - 1
+        num_frames = max(num_frames, 4)
 
-        if chunk_size <= 0 or chunk_size >= T:
+        # Fall back to full decode if requesting all frames
+        if num_frames >= T_pixel:
+            def _decode_all(lat):
+                return self.vae.decode_to_pixel(lat)
             return checkpoint_utils.checkpoint(
-                _decode, latent, use_reentrant=False
+                _decode_all, latent, use_reentrant=False
             )
 
-        pixel_chunks = []
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            chunk = latent[:, start:end]
-            pixel_chunk = checkpoint_utils.checkpoint(
-                _decode, chunk, use_reentrant=False
-            )
-            pixel_chunks.append(pixel_chunk)
+        # Uniform pixel indices across the full pixel timeline
+        pixel_indices = torch.linspace(0, T_pixel - 1, num_frames).round().long().tolist()
 
-        return torch.cat(pixel_chunks, dim=1)
+        vae = self.vae
+
+        pixel_frames = []
+        for p in pixel_indices:
+            # Map pixel index → source latent frame and offset within its 4 outputs
+            if p == 0:
+                lat_idx, offset = 0, 0
+            else:
+                lat_idx = (p - 1) // 4 + 1
+                offset = (p - 1) % 4
+
+            # Context window: [L-4, ..., L] (clamped to 0)
+            ctx_start = max(0, lat_idx - 4)
+            window = latent[:, ctx_start:lat_idx + 1]
+            pos = lat_idx - ctx_start  # target's position in window
+
+            # Decode and extract inside checkpoint so context pixels are freed
+            def _decode_extract(w, _pos=pos, _offset=offset):
+                px = vae.decode_to_pixel(w)
+                if _pos == 0:
+                    return px[:, 0:1]
+                idx = 1 + 4 * (_pos - 1) + _offset
+                return px[:, idx:idx + 1]
+
+            target_pixel = checkpoint_utils.checkpoint(
+                _decode_extract, window, use_reentrant=False
+            )
+            pixel_frames.append(target_pixel)
+
+        return torch.cat(pixel_frames, dim=1)
 
     def compute_rl_loss(
         self,
@@ -277,9 +318,10 @@ class DMDRL(DMD):
         Compute RL loss from generated latents.
 
         Pipeline:
-        1. Decode latent frames in contiguous chunks, each with checkpoint(decode())
-        2. Sub-sample pixel frames to rl_reward_num_frames
-        3. Compute reward, return negative reward as loss
+        1. Decode uniformly sampled pixel frames via context-window decode
+           (_decode_latent handles pixel→latent mapping and checkpoint)
+        2. Compute reward on the sampled frames
+        3. Return negative reward as loss
 
         Gradients flow: reward → pixel frames → VAE → latent → generator
 
@@ -301,9 +343,8 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Step 1: Decode latent frames to pixel space in chunks
-        # Each chunk wrapped in checkpoint(decode()); peak VAE activation
-        # memory is one chunk's worth (vae_chunk_size latent frames)
+        # Step 1: Decode target pixel frames (already uniformly sampled)
+        # Each target decoded with 2 causal context frames via checkpoint
         pixel_video = self._decode_latent(latent)
 
         # Compute rewards for each sample in the batch
@@ -312,11 +353,7 @@ class DMDRL(DMD):
         normalized_rewards_list = []
 
         for i in range(batch_size):
-            single_video = pixel_video[i]  # [T_decoded, 3, H, W]
-
-            # Step 2: Sub-sample pixel frames for reward model
-            # Full decode produces ~81 pixel frames → uniformly sample 10
-            sampled_video = self._sample_frames(single_video)
+            sampled_video = pixel_video[i]  # [num_frames, 3, H, W]
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
