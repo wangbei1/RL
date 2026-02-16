@@ -9,6 +9,58 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def load_generator_checkpoint(generator, checkpoint_path):
+    """
+    Load a checkpoint into WanDiffusionWrapper, handling:
+    - Multiple checkpoint formats (generator, generator_ema, model, flat)
+    - LoRA key prefix mismatch (base_model.model. prefix from PEFT)
+
+    Works regardless of whether LoRA has been applied to the generator.
+    """
+    print(f"Loading pretrained generator from {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+    # Extract the generator sub-dict from common checkpoint formats
+    if "generator" in state_dict:
+        state_dict = state_dict["generator"]
+    elif "generator_ema" in state_dict:
+        state_dict = state_dict["generator_ema"]
+    elif "model" in state_dict and isinstance(state_dict["model"], dict):
+        state_dict = state_dict["model"]
+
+    # Detect whether model has LoRA wrapping
+    has_lora = hasattr(generator.model, 'base_model')
+    # Detect whether checkpoint was saved from a LoRA-wrapped model
+    ckpt_has_lora = any('base_model.model.' in k for k in state_dict.keys())
+
+    if has_lora and not ckpt_has_lora:
+        # Model has LoRA but checkpoint has original keys →
+        # load into the unwrapped base model directly
+        print("[load_generator_checkpoint] LoRA detected on model; loading into base model")
+        base_sd = {}
+        prefix = "model."
+        for k, v in state_dict.items():
+            if k.startswith(prefix):
+                base_sd[k[len(prefix):]] = v
+            else:
+                base_sd[k] = v
+        generator.model.base_model.model.load_state_dict(base_sd, strict=True)
+    elif not has_lora and ckpt_has_lora:
+        # Checkpoint has LoRA keys but model is plain → strip the prefix
+        print("[load_generator_checkpoint] Stripping LoRA prefix from checkpoint keys")
+        new_sd = {}
+        for k, v in state_dict.items():
+            new_k = k.replace('base_model.model.', '')
+            if 'lora_' not in new_k:          # drop LoRA adapter weights
+                new_sd[new_k] = v
+        generator.load_state_dict(new_sd, strict=True)
+    else:
+        # Keys already match (both have LoRA or neither does)
+        generator.load_state_dict(state_dict, strict=True)
+
+    print("[load_generator_checkpoint] Checkpoint loaded successfully")
+
+
 def apply_lora_to_model(model, lora_rank=16, lora_alpha=32, lora_dropout=0.0, target_modules=None):
     """
     Apply LoRA (Low-Rank Adaptation) to a model using PEFT library.

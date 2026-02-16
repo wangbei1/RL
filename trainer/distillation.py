@@ -12,6 +12,7 @@ from utils.misc import (
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD, DMDRL
+from model.base import load_generator_checkpoint
 import torch
 import wandb
 import time
@@ -79,15 +80,7 @@ class Trainer:
 
         # Load generator checkpoint BEFORE LoRA/FSDP (original key names required)
         if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
+            load_generator_checkpoint(self.model.generator, config.generator_ckpt)
 
         # Apply LoRA AFTER checkpoint loading but BEFORE FSDP wrapping
         # (PEFT changes state_dict keys; FSDP must shard LoRA params too)
