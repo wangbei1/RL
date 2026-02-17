@@ -20,6 +20,11 @@ real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 text_encoder_fsdp_wrap_strategy: size
 
+# Optional: enable FSDP CPU offload to lower GPU peak memory
+generator_cpu_offload: false
+real_score_cpu_offload: false
+fake_score_cpu_offload: true
+
 # Model names
 real_name: Wan2.1-T2V-14B
 

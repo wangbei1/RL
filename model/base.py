@@ -14,7 +14,7 @@ def apply_lora_to_model(model, lora_rank=16, lora_alpha=32, lora_dropout=0.0, ta
     Apply LoRA (Low-Rank Adaptation) to a model using PEFT library.
     """
     try:
-        from peft import LoraConfig, get_peft_model, TaskType
+        from peft import LoraConfig, get_peft_model
     except ImportError:
         raise ImportError(
             "PEFT library is required for LoRA support. "
@@ -35,7 +35,10 @@ def apply_lora_to_model(model, lora_rank=16, lora_alpha=32, lora_dropout=0.0, ta
         lora_dropout=lora_dropout,
         target_modules=target_modules,
         bias="none",
-        task_type=TaskType.FEATURE_EXTRACTION,
+        # Keep task_type unset for custom Wan models.
+        # If set to a Transformers task type, PEFT may wrap forward() with
+        # HF-style arguments (e.g. input_ids), which does not match Wan's
+        # custom forward signature and causes runtime TypeError.
     )
 
     model = get_peft_model(model, lora_config)
