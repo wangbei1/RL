@@ -77,6 +77,21 @@ class Trainer:
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
 
+        # Load generator checkpoint BEFORE LoRA (original key names required)
+        if getattr(config, "generator_ckpt", False):
+            print(f"Loading pretrained generator from {config.generator_ckpt}")
+            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+            if "generator" in state_dict:
+                state_dict = state_dict["generator"]
+            elif "generator_ema" in state_dict:
+                state_dict = state_dict["generator_ema"]
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+            self.model.generator.load_state_dict(state_dict, strict=True)
+
+        # Apply LoRA AFTER checkpoint but BEFORE FSDP
+        self.model._apply_lora_if_enabled(config)
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -165,20 +180,7 @@ class Trainer:
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
         ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "generator_ema" in state_dict:
-                state_dict = state_dict["generator_ema"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-
+        # 7. Generator checkpoint already loaded before LoRA/FSDP (see above)
         ##############################################################################################################
 
         # Let's delete EMA params for early steps to save some computes at training and inference

@@ -106,6 +106,17 @@ rl_latent_window_size: 5         # Number of contiguous latents to decode (5 lat
 rl_reward_num_frames: 0          # Additional pixel-level sub-sampling (0 = use all decoded frames)
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
 
+# LoRA configuration
+use_lora: true                   # Enable LoRA for memory-efficient training
+lora_rank: 16                    # Rank of LoRA matrices
+lora_alpha: 32                   # Alpha parameter for LoRA scaling
+lora_dropout: 0.0                # Dropout probability for LoRA layers
+lora_target_modules:             # Wan model attention layer names
+  - q
+  - k
+  - v
+  - o
+
 # Other settings
 gradient_checkpointing: true
 num_frame_per_block: 3

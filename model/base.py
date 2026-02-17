@@ -9,6 +9,45 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def apply_lora_to_model(model, lora_rank=16, lora_alpha=32, lora_dropout=0.0, target_modules=None):
+    """
+    Apply LoRA (Low-Rank Adaptation) to a model using PEFT library.
+    """
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+    except ImportError:
+        raise ImportError(
+            "PEFT library is required for LoRA support. "
+            "Please install it with: pip install peft"
+        )
+
+    if target_modules is None:
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "to_q", "to_k", "to_v", "to_out",
+            "query", "key", "value",
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+        ]
+
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"[LoRA] Trainable params: {trainable_params:,} / {total_params:,} "
+          f"({100 * trainable_params / total_params:.2f}%)")
+
+    return model
+
+
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
@@ -22,6 +61,39 @@ class BaseModel(nn.Module):
             if args.warp_denoising_step:
                 timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+
+        # Note: LoRA is NOT applied here. The trainer controls the ordering:
+        #   1. load checkpoint (original keys)
+        #   2. apply LoRA (changes keys)
+        #   3. FSDP wrap
+
+    def _apply_lora_if_enabled(self, args):
+        """Apply LoRA to the generator model if enabled in config."""
+        use_lora = getattr(args, "use_lora", False)
+        if not use_lora:
+            return
+
+        print("[BaseModel] Applying LoRA to generator...")
+
+        lora_rank = getattr(args, "lora_rank", 16)
+        lora_alpha = getattr(args, "lora_alpha", 32)
+        lora_dropout = getattr(args, "lora_dropout", 0.0)
+        lora_target_modules = getattr(args, "lora_target_modules", None)
+
+        self.generator.model.requires_grad_(False)
+        self.generator.model = apply_lora_to_model(
+            self.generator.model,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=lora_target_modules
+        )
+
+        self.lora_config = {
+            "rank": lora_rank, "alpha": lora_alpha,
+            "dropout": lora_dropout, "target_modules": lora_target_modules
+        }
+        print(f"[BaseModel] LoRA applied with rank={lora_rank}, alpha={lora_alpha}")
 
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
