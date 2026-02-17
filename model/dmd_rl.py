@@ -10,15 +10,16 @@ Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
 - Cold start: RL loss only participates after a specified number of training steps
 - Reward normalization support for stable training
-- VAE decoding with gradient checkpointing for memory efficiency
-- Pixel-space frame sampling: only a configurable subset of decoded frames is sent to the reward model
-- Gradient checkpointing on reward model (Qwen2-VL)
+- Memory-efficient latent window decoding: only a random contiguous window of
+  latents is VAE-decoded instead of the full sequence
+- Gradient checkpointing on VAE decode and reward model (Qwen2-VL)
 - FSDP support for the reward model
 """
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint_utils
+import torch.distributed as dist
 from typing import Optional, Tuple
 
 from model.dmd import DMD
@@ -47,16 +48,18 @@ class DMDRL(DMD):
         # Memory optimization options
         self.rl_reward_fsdp = getattr(args, "rl_reward_fsdp", False)
 
-        # Frame sampling: only send a subset of frames to the reward model
-        # This dramatically reduces VRAM since Qwen2-VL attention is quadratic in token count
-        # 0 = no sampling (use all frames)
-        self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 10)
+        # Latent window: decode only a random contiguous window of latents
+        # instead of the full 21-frame sequence. This saves ~4x VAE memory.
+        # 0 = decode all latents (no windowing)
+        self.rl_latent_window_size = getattr(args, "rl_latent_window_size", 5)
+
+        # Pixel-level frame sampling on top of window decode
+        # 0 = no sampling (use all decoded pixel frames)
+        self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 0)
 
         # Reward normalization: use inference_config from reward model checkpoint
-        # (VQ_mean/std, MQ_mean/std, TA_mean/std) for proper z-score normalization
-        # These are loaded lazily when the reward model is initialized
-        self._reward_norm_mean = None  # [3] tensor: [VQ_mean, MQ_mean, TA_mean]
-        self._reward_norm_std = None   # [3] tensor: [VQ_std, MQ_std, TA_std]
+        self._reward_norm_mean = None
+        self._reward_norm_std = None
 
         # Running EMA for reward monitoring only (not used in loss computation)
         self.rl_reward_ema_mean = 0.0
@@ -97,8 +100,6 @@ class DMDRL(DMD):
         self._reward_model.inferencer.model.requires_grad_(False)
 
         # Enable gradient checkpointing on the reward model (Qwen2VL supports this)
-        # This trades compute for memory: intermediate activations are freed during
-        # forward and recomputed during backward
         reward_qwen_model = self._reward_model.inferencer.model
         if hasattr(reward_qwen_model, 'gradient_checkpointing_enable'):
             reward_qwen_model.gradient_checkpointing_enable(
@@ -132,17 +133,14 @@ class DMDRL(DMD):
                   f"using raw logits without normalization")
 
         self._reward_model_initialized = True
+        window_info = f"latent window={self.rl_latent_window_size}" if self.rl_latent_window_size > 0 else "full decode"
         print(f"[DMDRL] Reward model initialized and frozen successfully")
-        print(f"[DMDRL] VAE decode: checkpoint(decode(all)), then sample "
-              f"{self.rl_reward_num_frames} pixel frames")
+        print(f"[DMDRL] VAE decode strategy: {window_info}")
 
     def _fsdp_wrap_reward_model(self):
         """
         Wrap the reward model with FSDP to shard its parameters across GPUs.
-        Even though the reward model is frozen, FSDP sharding reduces per-GPU
-        memory usage for the model weights.
         """
-        import torch.distributed as dist
         if not dist.is_initialized():
             print(f"[DMDRL] Distributed not initialized, skipping reward model FSDP")
             return
@@ -179,35 +177,24 @@ class DMDRL(DMD):
 
     def _normalize_logits(self, rewards: torch.Tensor) -> torch.Tensor:
         """
-        Normalize raw reward logits [1, 3] using the inference_config from the
-        reward model checkpoint. This is a differentiable linear transform:
-            normalized[i] = (raw[i] - mean[i]) / std[i]
-
-        After normalization, each dimension (VQ, MQ, TA) is a z-score centered
-        around 0 with unit variance, making them comparable and well-scaled for RL.
-
-        Args:
-            rewards: [1, 3] raw logits tensor (VQ, MQ, TA) with gradient
-
-        Returns:
-            normalized: [1, 3] z-score normalized tensor (gradient preserved)
+        Normalize raw reward logits [1, 3] using z-score from inference_config.
+        Differentiable linear transform preserving gradients.
         """
         if self._reward_norm_mean is None or self._reward_norm_std is None:
             return rewards
 
-        # Differentiable z-score normalization: (x - mean) / std
         mean = self._reward_norm_mean.to(device=rewards.device, dtype=rewards.dtype)
         std = self._reward_norm_std.to(device=rewards.device, dtype=rewards.dtype)
         return (rewards - mean.unsqueeze(0)) / std.unsqueeze(0)
 
-    def _sample_frames(self, video: torch.Tensor, num_frames: int = 0) -> torch.Tensor:
+    def _sample_pixel_frames(self, video: torch.Tensor, num_frames: int = 0) -> torch.Tensor:
         """
-        Uniformly sample a subset of frames from a video tensor.
+        Uniformly sample a subset of frames from a decoded pixel video tensor.
         Ensures an even number of frames (reward model requires temporal_patch_size=2).
 
         Args:
             video: [T, C, H, W] video tensor (with gradient)
-            num_frames: number of frames to sample (0 = use self.rl_reward_num_frames)
+            num_frames: number of frames to sample (0 = use all)
 
         Returns:
             sampled: [T_sampled, C, H, W] sampled frames (gradient preserved)
@@ -217,6 +204,7 @@ class DMDRL(DMD):
             num_frames = self.rl_reward_num_frames
 
         if num_frames <= 0 or num_frames >= T:
+            # Ensure even number of frames
             if T % 2 != 0:
                 video = video[:T - 1]
             return video
@@ -227,15 +215,16 @@ class DMDRL(DMD):
         indices = torch.linspace(0, T - 1, num_frames).round().long()
         return video[indices]
 
-    def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+    def _decode_latent_window(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode all latent frames to pixel space with gradient checkpointing.
+        Decode a contiguous window of latent frames to pixel space.
+        Uses gradient checkpointing to save memory.
 
         Args:
-            latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
+            latent: [B, T_window, C, H, W] latent window tensor
 
         Returns:
-            pixel_video: [B, T_pixel, C, H, W] decoded video (e.g., T_pixel=81)
+            pixel_video: [B, T_pixel, C, H, W] decoded video
         """
         def _decode(lat):
             return self.vae.decode_to_pixel(lat)
@@ -253,14 +242,15 @@ class DMDRL(DMD):
         Compute RL loss from generated latents.
 
         Pipeline:
-        1. Decode all latent frames to pixel space with checkpoint
-        2. Uniformly sub-sample pixel frames to rl_reward_num_frames
-        3. Compute reward, return negative reward as loss
+        1. Randomly select a contiguous window of latents (synced across ranks)
+        2. Decode only the window to pixel space with gradient checkpoint
+        3. Optionally sub-sample pixel frames
+        4. Compute reward, return negative reward as loss
 
-        Gradients flow: reward → pixel frames → VAE → latent → generator
+        Gradients flow: reward -> pixel frames -> VAE -> latent window -> generator
 
         Args:
-            latent: Generated latent tensor [B, T, C, H, W]
+            latent: Generated latent tensor [B, T, C, H, W] (e.g. T=21)
             text_prompts: List of text prompts
 
         Returns:
@@ -276,9 +266,23 @@ class DMDRL(DMD):
             }
 
         batch_size = latent.shape[0]
+        T_latent = latent.shape[1]  # e.g. 21
 
-        # Step 1: Decode all latent frames to pixel space with checkpoint
-        pixel_video = self._decode_latent(latent)
+        # Step 1: Select contiguous latent window (synced across ranks)
+        window_size = self.rl_latent_window_size
+        if window_size > 0 and window_size < T_latent:
+            max_start = T_latent - window_size
+            window_start = torch.randint(0, max_start + 1, (1,), device=self.device)
+            dist.broadcast(window_start, src=0)
+            window_start = window_start.item()
+            latent_window = latent[:, window_start:window_start + window_size, ...]
+        else:
+            latent_window = latent
+            window_start = 0
+            window_size = T_latent
+
+        # Step 2: Decode the latent window to pixel space
+        pixel_video = self._decode_latent_window(latent_window)
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
@@ -288,8 +292,8 @@ class DMDRL(DMD):
         for i in range(batch_size):
             single_video = pixel_video[i]  # [T_decoded, 3, H, W]
 
-            # Step 2: Sub-sample pixel frames for reward model
-            sampled_video = self._sample_frames(single_video)
+            # Step 3: Optionally sub-sample pixel frames
+            sampled_video = self._sample_pixel_frames(single_video)
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
@@ -334,7 +338,8 @@ class DMDRL(DMD):
             "rl_reward_normalized": sum(normalized_rewards_list) / len(normalized_rewards_list),
             "rl_reward_ema_mean": self.rl_reward_ema_mean,
             "rl_reward_ema_std": self.rl_reward_ema_std,
-            "rl_reward_num_frames": self.rl_reward_num_frames,
+            "rl_latent_window_start": window_start,
+            "rl_latent_window_size": window_size,
             "rl_enabled": True
         }
 

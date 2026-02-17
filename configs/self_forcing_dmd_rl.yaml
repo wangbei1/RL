@@ -4,9 +4,8 @@
 # Key Features:
 # - DMD loss for distribution matching
 # - RL loss from video reward model (DifferentiableVideoReward) with direct backprop
-# - VAE decode with gradient checkpointing + pixel frame sampling
-# - Gradient checkpointing on reward model
-# - LoRA on generator (q, k, v, o) for memory-efficient training
+# - Memory-efficient latent window: only decode a random contiguous window of latents
+# - Gradient checkpointing on VAE decode and reward model
 # - Cold start mechanism for RL
 #
 # Usage:
@@ -102,21 +101,10 @@ rl_reward_type: overall          # Reward type: 'VQ', 'MQ', 'TA', or 'overall'
 rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (logging only)
 
 # Memory optimization for RL
-rl_reward_num_frames: 10         # Number of pixel frames uniformly sub-sampled for reward model (0 = all)
+rl_latent_window_size: 5         # Number of contiguous latents to decode (5 latents → ~17 pixel frames)
+                                 # 0 = decode all latents (no windowing). Saves ~4x VAE memory.
+rl_reward_num_frames: 0          # Additional pixel-level sub-sampling (0 = use all decoded frames)
 rl_reward_fsdp: false            # Set to true to FSDP-shard the reward model across GPUs
-
-# ============================================
-# LoRA configuration (optional, for stable training)
-# ============================================
-use_lora: true                   # Enable LoRA for memory-efficient training
-lora_rank: 16                    # Rank of LoRA matrices
-lora_alpha: 32                   # Alpha parameter for LoRA scaling
-lora_dropout: 0.0                # Dropout probability for LoRA layers
-lora_target_modules:             # Wan model attention layer names
-  - q
-  - k
-  - v
-  - o
 
 # Other settings
 gradient_checkpointing: true
