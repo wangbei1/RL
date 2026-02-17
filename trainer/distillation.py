@@ -90,21 +90,24 @@ class Trainer:
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "generator_cpu_offload", False)
         )
 
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "real_score_cpu_offload", False)
         )
 
         self.model.fake_score = fsdp_wrap(
             self.model.fake_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy
+            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "fake_score_cpu_offload", False)
         )
 
         self.model.text_encoder = fsdp_wrap(

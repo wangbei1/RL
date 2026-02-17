@@ -18,3 +18,7 @@ num_samples: 1
 height: 480
 width: 832
 num_frames: 81
+# FSDP CPU offload knobs (set true to reduce VRAM at the cost of speed)
+generator_cpu_offload: false
+real_score_cpu_offload: false
+fake_score_cpu_offload: false
