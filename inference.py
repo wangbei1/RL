@@ -15,6 +15,7 @@ from pipeline import (
     CausalInferencePipeline,
 )
 from utils.dataset import TextDataset, TextImagePairDataset
+from utils.checkpoint import extract_model_state_dict
 from utils.misc import set_seed
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
@@ -67,19 +68,10 @@ else:
     pipeline = CausalDiffusionInferencePipeline(config, device=device)
 
 if args.checkpoint_path:
-    state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-
-    # Select the correct dictionary (EMA or non-EMA)
-    key = 'generator' if not args.use_ema else 'generator_ema'
-    raw_dict = state_dict[key]
-
-    # Remove the "_fsdp_wrapped_module." prefix from FSDP-saved checkpoints
-    new_state_dict = {}
-    for k, v in raw_dict.items():
-        name = k.replace("_fsdp_wrapped_module.", "")
-        new_state_dict[name] = v
-
-    pipeline.generator.load_state_dict(new_state_dict)
+    checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    state_dict, key = extract_model_state_dict(checkpoint, prefer_ema=args.use_ema)
+    print(f"Loading generator weights from checkpoint key: {key}")
+    pipeline.generator.load_state_dict(state_dict)
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:

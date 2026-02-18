@@ -3,6 +3,7 @@ from typing import Tuple
 import torch
 
 from model.base import BaseModel
+from utils.checkpoint import extract_model_state_dict
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
@@ -23,8 +24,9 @@ class ODERegression(BaseModel):
         self.generator.model.requires_grad_(True)
         if getattr(args, "generator_ckpt", False):
             print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
-                'generator']
+            checkpoint = torch.load(args.generator_ckpt, map_location="cpu")
+            state_dict, key = extract_model_state_dict(checkpoint)
+            print(f"Using checkpoint key: {key}")
             self.generator.load_state_dict(
                 state_dict, strict=True
             )
